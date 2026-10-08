@@ -6,7 +6,7 @@ from datetime import datetime,timezone
 import ast,json
 from sqlalchemy import select,delete
 from sqlalchemy.orm import Session
-from cx_repository import CxRepository,private_key,public_key
+from cx_repository import CxRepository,private_key,public_key,validate_provisioned_public_uri
 from database import IMS_SUBSCRIBER,SUBSCRIBER,AUC
 
 class ProvisioningConflict(ValueError):pass
@@ -76,20 +76,37 @@ class CxProvisioning:
         # Generated from provisioned fields, never derived from an incoming REGISTER.
         private=[primary];public=[];aliases={}
         for number in numbers(record):
-            # The no-plus SIP user is an explicit compatibility identity. TEL
-            # public identities use global E.164 notation; a bare local TEL
-            # URI would require phone-context (RFC 3966 sections 5.1/5.1.5).
-            for identity in ('sip:'+number+'@'+realm,'tel:'+number,'sip:'+number[1:]+'@'+realm):
+            # Calling identities are canonical. Digest lookup aliases below
+            # are private identities, not additional advertised public URIs.
+            for identity in ('sip:'+number+'@'+realm+';user=phone','tel:'+number):
                 public.append({'identity':identity,'set_id':set_id})
             if mode!='aka':
                 for alias in (number+'@'+realm,number[1:]+'@'+realm):
                     if alias!=primary:
                         private.append(alias);aliases[alias]=primary
-        public.append({'identity':'sip:'+primary,'set_id':set_id})
-        if 'bar_private_impu' in policy or mode!='aka':public[-1]['barred']=policy.get('bar_private_impu',True)
+        private_public='sip:'+primary
+        private_user=primary.partition('@')[0]
+        if private_user.startswith('+') and private_user[1:].isascii() and private_user[1:].isdigit():private_public+=';user=phone'
+        if not any(item['identity']==private_public for item in public):
+            public.append({'identity':private_public,'set_id':set_id,'barred':policy.get('bar_private_impu',meta.get('bar_private_impu',True))})
+        elif 'bar_private_impu' in policy:
+            next(item for item in public if item['identity']==private_public)['barred']=policy['bar_private_impu']
         private=list(dict.fromkeys(private))
         for item in public:item['private_identities']=list(private)
         allowed=['Digest-AKAv1-MD5','SIP Digest'] if mode=='dual' else ['SIP Digest'] if mode=='sip_digest' else ['Digest-AKAv1-MD5']
+        extra=policy.get('additional_public_identities',meta.get('additional_public_identities',[]))
+        if not isinstance(extra,list):raise ValueError('cx.additional_public_identities must be a list of full public URIs or identity objects')
+        explicit=[]
+        for item in extra:
+            item={'identity':item} if isinstance(item,str) else deepcopy(item)
+            if not isinstance(item,dict) or 'identity' not in item:raise ValueError('Additional public identity requires a full URI')
+            item['identity']=validate_provisioned_public_uri(item['identity'])
+            previous_item=next((entry for entry in (existing or {}).get('public_identities',[]) if entry['identity']==item['identity']),{})
+            for field in ('set_id','barred','can_register'):
+                if field in previous_item:item.setdefault(field,previous_item[field])
+            item.setdefault('set_id',set_id)
+            if any(entry['identity']==item['identity'] for entry in public+explicit):raise ValueError('Duplicate additional public identity: '+item['identity'])
+            item.setdefault('private_identities',list(private));explicit.append(item)
         result={'private_identities':private,'public_identities':public,
             'authentication_scheme':allowed[0],'authentication_schemes':{identity:allowed if identity==primary else 'SIP Digest' for identity in private},
             'digest_realm':policy.get('digest_realm') or realm,
@@ -98,7 +115,8 @@ class CxProvisioning:
             'service_type':policy.get('service_type') or (existing or {}).get('service_type') or ('fixed_voice' if mode=='sip_digest' else 'mobile_voice_data'),
             'provisioning':{'authentication':mode,'realm':realm,'set_id':set_id,'private_identity':primary,
                 'custom_private_identity':bool(policy.get('private_identity') or meta.get('custom_private_identity')),
-                'managed_private':list(private),'managed_public':[item['identity'] for item in public]}}
+                'managed_private':list(private),'managed_public':[item['identity'] for item in public],
+                'bar_private_impu':next(item.get('barred',False) for item in public if item['identity']==private_public),'additional_public_identities':deepcopy(explicit)}}
         if existing:
             # Preserve explicitly provisioned non-generated identities and their policies.
             old_meta=existing.get('provisioning',{})
@@ -110,9 +128,13 @@ class CxProvisioning:
                 old_private={old_primary};old_public={'sip:'+old_primary}
                 for number in numbers(old_record):
                     old_private.update((number+'@'+old_realm,number[1:]+'@'+old_realm))
-                    old_public.update(('sip:'+number+'@'+old_realm,'tel:'+number,'sip:'+number[1:]+'@'+old_realm,'tel:'+number[1:]))
-            custom_public=[deepcopy(item) for item in existing['public_identities'] if item['identity'] not in old_public]
-            retained=set(identity for item in custom_public for identity in item['private_identities'])
+                    # Without ownership metadata, a manually stored no-plus URI
+                    # may be deliberate. Never infer that it was generated.
+                    old_public.update(('sip:'+number+'@'+old_realm,'sip:'+number+'@'+old_realm+';user=phone','tel:'+number))
+            old_explicit={item['identity'] for item in old_meta.get('additional_public_identities',[])}
+            explicit_ids={item['identity'] for item in explicit}
+            custom_public=[] if 'additional_public_identities' in policy else [deepcopy(item) for item in existing['public_identities'] if item['identity'] not in old_public|old_explicit|explicit_ids]
+            retained=set(identity for item in custom_public+explicit for identity in item['private_identities'])
             custom_private=[identity for identity in existing['private_identities'] if identity not in old_private or identity in retained]
             result['private_identities']=list(dict.fromkeys(private+custom_private))
             result['public_identities']+=custom_public
@@ -125,12 +147,22 @@ class CxProvisioning:
                 members=[item for item in result['public_identities'] if item['set_id']==group]
                 associations=list(dict.fromkeys(identity for item in members for identity in item['private_identities']))
                 for item in members:item['private_identities']=list(associations)
+        result['public_identities']+=explicit
+        # An added service identity in an existing set shares that set's private
+        # associations. A complete cx profile remains available for finer policy.
+        for group in {item['set_id'] for item in result['public_identities']}:
+            members=[item for item in result['public_identities'] if item['set_id']==group]
+            associations=list(dict.fromkeys(identity for item in members for identity in item['private_identities']))
+            for item in members:item['private_identities']=list(associations)
         # Refuse a profile whose IFC cannot subsequently be returned in SAA.
         # Preserve operator-provisioned barring for existing identities.
         bars={item['identity']:item['barred'] for item in (existing or {}).get('public_identities',[])}
         for item in result['public_identities']:
-            if item['identity'] in bars and not ('bar_private_impu' in policy and item['identity']=='sip:'+primary):
+            generated_private=item['identity']==private_public
+            override_private=generated_private and ('bar_private_impu' in policy or bool(meta))
+            if item['identity'] in bars and item['identity'] not in explicit_ids and not override_private:
                 item['barred']=bars[item['identity']]
+        result['provisioning']['bar_private_impu']=next(item.get('barred',False) for item in result['public_identities'] if item['identity']==private_public)
         self.repo.xml(record)
         return self.repo.prepare_definition(record,result)
 

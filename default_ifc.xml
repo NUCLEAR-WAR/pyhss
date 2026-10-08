@@ -4,7 +4,7 @@
     <PrivateID>{{ iFC_vars['imsi'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</PrivateID>
     <ServiceProfile>
         <PublicIdentity>
-            <Identity>sip:{{ iFC_vars['msisdn'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</Identity>
+            <Identity>sip:+{{ iFC_vars['msisdn'] | string | replace('+', '') }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org;user=phone</Identity>
             <Extension>
                 <IdentityType>0</IdentityType>
                 <Extension>
@@ -13,7 +13,7 @@
             </Extension>
         </PublicIdentity>
         <PublicIdentity>
-            <Identity>tel:{{ iFC_vars['msisdn'] }}</Identity>
+            <Identity>tel:+{{ iFC_vars['msisdn'] | string | replace('+', '') }}</Identity>
             <Extension>
                 <IdentityType>0</IdentityType>
                 <Extension>
@@ -22,6 +22,7 @@
             </Extension>
         </PublicIdentity>
         <PublicIdentity>
+            <BarringIndication>1</BarringIndication>
             <Identity>sip:{{ iFC_vars['imsi'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</Identity>
             <Extension>
                 <IdentityType>0</IdentityType>

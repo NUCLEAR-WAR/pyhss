@@ -13,7 +13,14 @@ class RedisMessaging:
         if useUnixSocket:
             self.redisClient = Redis(unix_socket_path=unixSocketPath)
         else:
-            self.redisClient = Redis(host=host, port=port)
+            from pyhss_config import config
+            policy=config.get('redis',{}).get('discovery')
+            if policy is None:self.redisClient = Redis(host=host, port=port)
+            else:
+                from redis import ConnectionPool
+                from service_discovery import redis_connection_class,hostname
+                pool=ConnectionPool(connection_class=redis_connection_class(),discovery_policy=policy,host=hostname(policy['domain']),port=0)
+                self.redisClient=Redis(connection_pool=pool)
 
     def handlePrefix(self, key: str, usePrefix: bool=False, prefixHostname: str='unknown', prefixServiceName: str='common'):
         """

@@ -10,7 +10,7 @@ from contextlib import contextmanager,nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-import json
+import json,re
 import xml.etree.ElementTree as ET
 import jinja2
 from sqlalchemy import (MetaData,Table,Column,Integer,String,Text,DateTime,
@@ -37,6 +37,45 @@ def public_key(identity):
         hostpart,semi,params=host.partition(';')
         rest=user+'@'+hostpart.lower()+(semi+params if semi else '')
     return scheme.lower()+':'+rest
+
+def validate_provisioned_public_uri(identity,private_derived=False):
+    """Validate new TEL provisioning without invalidating legacy reads.
+
+    SIP service users need no plus. Local TEL numbers require an explicit
+    phone-context; global TEL numbers start with plus (RFC 3966 section 5.1).
+    """
+    identity=public_key(identity)
+    if identity.startswith(('sip:','sips:')):
+        user,_,host=identity.partition(':')[2].partition('@')
+        number,*user_parameters=user.split(';')
+        uri_parameters=host.split(';')[1:]
+        users=[p.partition('=')[2].lower() for p in uri_parameters if p.partition('=')[0].lower()=='user']
+        if len(users)>1:raise ValueError('SIP identity has duplicate user parameter: '+identity)
+        if any(p.partition('=')[0].lower()=='phone-context' for p in uri_parameters):
+            raise ValueError('SIP telephone phone-context must precede @: '+identity)
+        phone_context=any(p.partition('=')[0].lower()=='phone-context' for p in user_parameters)
+        if users==['phone']:
+            validate_provisioned_public_uri('tel:'+user)
+        elif number.startswith('+') or phone_context or (number.isascii() and number.isdigit() and not private_derived and not users):
+            raise ValueError('SIP telephone public identity requires user=phone: '+identity)
+        return identity
+    if not identity.startswith('tel:'):return identity
+    number,*parameters=identity[4:].split(';')
+    global_number=number.startswith('+')
+    digits=number[1:] if global_number else number
+    pattern=r'[0-9().-]*[0-9][0-9().-]*' if global_number else r'[0-9A-Fa-f*#().-]*[0-9A-Fa-f*#][0-9A-Fa-f*#().-]*'
+    if not re.fullmatch(pattern,digits):raise ValueError('Invalid TEL telephone number: '+identity)
+    contexts=[parameter.partition('=')[2] for parameter in parameters if parameter.partition('=')[0].lower()=='phone-context']
+    if not global_number and not contexts:raise ValueError('Local TEL public identity requires phone-context: '+identity)
+    if len(contexts)>1:raise ValueError('TEL public identity has duplicate phone-context: '+identity)
+    if contexts:
+        context=contexts[0]
+        if context.startswith('+'):
+            valid=re.fullmatch(r'\+[0-9().-]*[0-9][0-9().-]*',context)
+        else:
+            valid=re.fullmatch(r'(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?',context)
+        if not valid:raise ValueError('Invalid TEL phone-context: '+identity)
+    return identity
 
 def private_key(identity):
     if not isinstance(identity,str) or identity!=identity.strip() or any(c.isspace() for c in identity):
@@ -194,16 +233,18 @@ class CxRepository:
         value=definition.get('authentication_schemes',{}).get(profile.get('private'),definition['authentication_scheme'])
         return [value] if isinstance(value,str) else list(value)
 
-    def prepare_definition(self,record,definition):
+    def prepare_definition(self,record,definition,allow_partial_sets=False):
         # Missing flags inherit rendered IFC barring. Explicit booleans win.
         definition=deepcopy(definition)
         try:
             template_barring={item['identity']:item['barred'] for item in self.legacy_profile(record)['public_identities']}
         except (ValueError,ET.ParseError,jinja2.TemplateError):template_barring={}
         for item in definition.get('public_identities',[]):
-            key=public_key(item['identity'])
+            native_private=set(definition.get('private_identities',[]))-set(definition.get('digest_identity_aliases',{}))
+            private_derived=item['identity'] in {'sip:'+private for private in native_private}|{'sips:'+private for private in native_private}
+            key=validate_provisioned_public_uri(item['identity'],private_derived=private_derived)
             if 'barred' not in item and key in template_barring:item['barred']=template_barring[key]
-        return self.validate_definition(definition)
+        return self.validate_definition(definition,allow_partial_sets=allow_partial_sets)
 
     def provision(self,profile_id,definition,replace=False,clear_authentication_pending=False,connection=None):
         with (nullcontext(connection) if connection is not None else self.transaction([profile_id])) as c:

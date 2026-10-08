@@ -26,7 +26,7 @@ FIXED_SECRET=secrets.token_urlsafe(18)
 MOBILE_KEY=secrets.token_hex(16);MOBILE_OPC=secrets.token_hex(16)
 REALM=uuid.uuid4().hex+'.invalid'
 IMPI='+'+FIXED_MSISDN+'@'+REALM
-IMPU='sip:'+IMPI
+IMPU='sip:'+IMPI+';user=phone'
 SERVER='sip:scscf.'+REALM
 MOBILE_IMPI=MOBILE_IMSI+'@'+REALM
 MOBILE_IMPU='sip:'+MOBILE_IMPI
@@ -77,7 +77,7 @@ def lab(tmp_path,monkeypatch):
     repo.provision(profiles[1][0]['ims_subscriber_id'],{
         'private_identities':[MOBILE_IMPI],'public_identities':[
             {'identity':MOBILE_IMPU,'set_id':'mobile','barred':True},
-            {'identity':'sip:+'+MOBILE_MSISDN+'@'+REALM,'set_id':'mobile','barred':False}],
+            {'identity':'sip:+'+MOBILE_MSISDN+'@'+REALM+';user=phone','set_id':'mobile','barred':False}],
         'authentication_scheme':'Digest-AKAv1-MD5','digest_realm':REALM,
         'visited_networks':[REALM]})
     yield d,profiles

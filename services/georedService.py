@@ -14,6 +14,7 @@ from messagingAsync import RedisMessagingAsync
 from banners import Banners
 from logtool import LogTool
 from pyhss_config import config
+from service_discovery import resolve_http_url
 
 class GeoredService:
     """
@@ -70,11 +71,13 @@ class GeoredService:
                     responseBody = None
 
                     if operation in ['PUT', 'POST', 'PATCH']:
-                        async with requestOperations[operation](url, json=body, headers=headers) as response:
+                        endpoint_url=await asyncio.to_thread(resolve_http_url,url,config.get('http_discovery'))
+                        async with requestOperations[operation](endpoint_url, json=body, headers=headers) as response:
                             responseBody = await(response.text())
                             responseStatusCode = response.status
                     else:
-                        async with requestOperations[operation](url, headers=headers) as response:
+                        endpoint_url=await asyncio.to_thread(resolve_http_url,url,config.get('http_discovery'))
+                        async with requestOperations[operation](endpoint_url, headers=headers) as response:
                             responseBody = await(response.text())
                             responseStatusCode = response.status
 
@@ -193,11 +196,13 @@ class GeoredService:
                     responseBody = None
 
                     if operation in ['PUT', 'POST', 'PATCH']:
-                        async with requestOperations[operation](url, json=body, headers=headers) as response:
+                        endpoint_url=await asyncio.to_thread(resolve_http_url,url,config.get('http_discovery'))
+                        async with requestOperations[operation](endpoint_url, json=body, headers=headers) as response:
                             responseBody = await(response.text())
                             responseStatusCode = response.status
                     else:
-                        async with requestOperations[operation](url, headers=headers) as response:
+                        endpoint_url=await asyncio.to_thread(resolve_http_url,url,config.get('http_discovery'))
+                        async with requestOperations[operation](endpoint_url, headers=headers) as response:
                             responseBody = await(response.text())
                             responseStatusCode = response.status
 

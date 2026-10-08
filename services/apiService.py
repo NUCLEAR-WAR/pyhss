@@ -161,7 +161,8 @@ imsSubscriberSchema = databaseClient.Generate_JSON_Model_for_Flask(IMS_SUBSCRIBE
 imsSubscriberSchema['properties']['cx'] = {'type':'object','description':'Static Cx provisioning policy or complete profile. Omit for configured/default AKA; fixed services select sip_digest explicitly.',
     'properties':{'authentication':{'type':'string','enum':['aka','sip_digest','dual']},
                   'realm':{'type':'string'},'private_identity':{'type':'string'},
-                  'service_type':{'type':'string'},'clear_authentication_pending':{'type':'boolean'}}}
+                  'service_type':{'type':'string'},'clear_authentication_pending':{'type':'boolean'},
+                  'additional_public_identities':{'type':'array','items':{'oneOf':[{'type':'string'},{'type':'object'}]},'description':'Deliberately provisioned service/public URIs. Telephone SIP uses user=phone after the host, and local phone-context before @. Local TEL also requires phone-context.'}}}
 IMS_SUBSCRIBER_model = api.schema_model('IMS_SUBSCRIBER JSON', imsSubscriberSchema)
 
 TFT_model = api.schema_model('TFT JSON', 
@@ -1549,7 +1550,8 @@ class PyHSS_OAM_Reconcile_IMS(Resource):
             for remote_HSS in config['geored']['sync_endpoints']:
                 print("Pulling data from remote HSS: " + str(remote_HSS))
                 try:
-                    response = requests.get(remote_HSS + '/ims_subscriber/ims_subscriber_imsi/' + str(imsi))
+                    from service_discovery import resolve_http_url
+                    response = requests.get(resolve_http_url(remote_HSS + '/ims_subscriber/ims_subscriber_imsi/' + str(imsi),config.get('http_discovery')))
                     response_dict[remote_HSS] = {}
                     for keys in response.json():
                         if 'cscf' in keys:

@@ -40,9 +40,15 @@ def database_connection_settings(db_cfg):
         db_string = URL.create('sqlite', database=str(db_cfg['database']))
     elif db_type in ('mysql', 'mariadb', 'postgresql'):
         driver = 'postgresql+psycopg2' if db_type == 'postgresql' else 'mysql+pymysql'
-        server = str(db_cfg['server']); port = db_cfg.get('port')
-        if server.count(':') == 1:
-            server, server_port = server.split(':'); port = port or server_port
+        if db_cfg.get('discovery') is not None:
+            from service_discovery import discovery,DiscoveryError
+            endpoint=discovery.resolve(db_cfg['discovery'])
+            if endpoint.transport!='tcp':raise DiscoveryError('SQL database requires TCP discovery')
+            server,port=endpoint.host,endpoint.port
+        else:
+            server = str(db_cfg['server']); port = db_cfg.get('port')
+            if server.count(':') == 1:
+                server, server_port = server.split(':'); port = port or server_port
         db_string = URL.create(driver, username=str(db_cfg['username']), password=str(db_cfg['password']),
             host=server, port=int(port) if port else None, database=str(db_cfg['database']))
     else:
@@ -519,6 +525,9 @@ class Database:
             pool_recycle=config['logging'].get('sqlalchemy_pool_recycle', 5),
             pool_size=config['logging'].get('sqlalchemy_pool_size', 30),
             max_overflow=config['logging'].get('sqlalchemy_max_overflow', 0))
+        if self.engine.dialect.name in ('mysql','postgresql'):
+            from service_discovery import install_database_discovery
+            install_database_discovery(self.engine,config['database'].get('discovery'))
 
         DatabaseSchema(self.logTool, Base, self.engine, main_service)
 

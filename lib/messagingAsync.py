@@ -16,7 +16,13 @@ class RedisMessagingAsync:
         if useUnixSocket:
             self.redisClient = redis.Redis(unix_socket_path=unixSocketPath)
         else:
-            self.redisClient = redis.Redis(host=host, port=port)
+            from pyhss_config import config
+            policy=config.get('redis',{}).get('discovery')
+            if policy is None:self.redisClient = redis.Redis(host=host, port=port)
+            else:
+                from service_discovery import redis_connection_class,hostname
+                pool=redis.ConnectionPool(connection_class=redis_connection_class(True),discovery_policy=policy,host=hostname(policy['domain']),port=0)
+                self.redisClient=redis.Redis(connection_pool=pool)
         pass
 
     async def handlePrefix(self, key: str, usePrefix: bool=False, prefixHostname: str='unknown', prefixServiceName: str='common'):

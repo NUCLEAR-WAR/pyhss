@@ -91,7 +91,7 @@ def main():
             p.error('Supply --profile or all of --private-identity, --public-identity, --authentication-scheme and --visited-network')
         definition={
             'private_identities':args.private_identity,
-            'public_identities':[{'identity':identity,'set_id':args.set_id,'barred':False} for identity in args.public_identity],
+            'public_identities':[{'identity':identity,'set_id':args.set_id} for identity in args.public_identity],
             'authentication_scheme':args.authentication_scheme,
             'digest_realm':args.digest_realm or args.private_identity[0].rpartition('@')[2],
             'visited_networks':args.visited_network,'unregistered_service':args.unregistered_service,
@@ -107,6 +107,7 @@ def main():
             ident=rows[0][0]
         if args.preserve_existing:
             record=repo.record(ident,c)
+            definition=repo.prepare_definition(record,definition,allow_partial_sets=True)
             definition=preserve_definition(repo.definition(record,c),definition,args.allow_additional_scheme,args.associate_existing_public)
     repo.provision(ident,definition,args.replace,clear_authentication_pending=args.clear_authentication_pending)
     print(f'Provisioned Cx identities for IMS subscriber #{ident}; no registration or S-CSCF was assigned')

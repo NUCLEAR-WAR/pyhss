@@ -10,7 +10,7 @@ from test_cx_associations import tool_module
 from test_cx_registration import NullLog
 
 def configure(d,record):
-    repo=d.cx.repo;alias='+'+digits(11)+'@'+REALM;public='sip:'+alias
+    repo=d.cx.repo;alias='+'+digits(11)+'@'+REALM;public='sip:'+alias+';user=phone'
     with repo.engine.connect() as c:base=repo.definition(record,c)
     extra={'private_identities':[MOBILE_IMPI,alias],
         'public_identities':[{'identity':public,'set_id':'fixed','barred':False}],

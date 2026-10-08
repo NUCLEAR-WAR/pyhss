@@ -14,7 +14,7 @@ def tool_module():
 
 def fixed_alias(d,record):
     tool=tool_module();repo=d.cx.repo
-    private='+'+digits(11)+'@'+REALM;public='sip:'+private;tel='tel:'+private.partition('@')[0]
+    private='+'+digits(11)+'@'+REALM;public='sip:'+private+';user=phone';tel='tel:'+private.partition('@')[0]
     with repo.engine.connect() as c:existing=repo.definition(record,c)
     extra={'private_identities':[private],
         'public_identities':[{'identity':identity,'set_id':'fixed','barred':False} for identity in (public,tel)],

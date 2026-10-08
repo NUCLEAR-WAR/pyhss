@@ -86,6 +86,22 @@ def test_guided_forms_have_no_subscriber_or_password_defaults(ui_client):
             match=re.search(r'<input[^>]*name="'+name+r'"[^>]*value="([^"]*)"',text)
             if match:assert match[1]==''
 
+def test_ui_explicit_service_uris_require_tel_context_and_survive_edit(ui_client):
+    client,ui,module,d=ui_client;imsi=digits(15);number=digits(11);service=digits(4)
+    services=['sip:'+service+';phone-context='+REALM+'@'+REALM+';user=phone','tel:'+service+';phone-context='+REALM]
+    form={'profile':'fixed_voice','imsi':imsi,'msisdn':'+'+number,'digest_password':'test-'+digits(16),'cx_realm':REALM,'ifc_path':'default_ifc.xml','cx_additional_public_identities':', '.join(services)}
+    response=client.post('/provision',data=form);assert 'Native provisioning failed' not in response.text,response.text
+    ims=ui.one(ui.PYHSS_DB,'SELECT * FROM ims_subscriber WHERE imsi=?',(imsi,));sid=ui.one(ui.PYHSS_DB,'SELECT * FROM subscriber WHERE imsi=?',(imsi,))['subscriber_id']
+    page=client.get('/subscribers/'+str(sid)+'/edit').text
+    assert all(identity in page for identity in services)
+    response=client.post('/subscribers/'+str(sid)+'/edit',data={'msisdn':number,'cx_authentication':'sip_digest','cx_realm':REALM,'ifc_path':'default_ifc.xml','cx_additional_public_identities':', '.join(services)})
+    assert response.status_code==303,response.text
+    updated=module.cxProvisioning.get(ims['ims_subscriber_id'])
+    assert all(identity in [item['identity'] for item in updated['cx']['public_identities']] for identity in services)
+    form.update(imsi=digits(15),msisdn='+'+digits(11),cx_additional_public_identities='tel:'+service)
+    response=client.post('/provision',data=form)
+    assert 'requires phone-context' in response.text
+
 def test_service_ui_edit_updates_cx_and_keeps_blank_credentials(ui_client):
     client,ui,module,d=ui_client;payload=bundle(d)
     saved=module.cxProvisioning.create_service(payload)
@@ -94,7 +110,41 @@ def test_service_ui_edit_updates_cx_and_keeps_blank_credentials(ui_client):
     assert response.status_code==303,response.text
     ims=module.cxProvisioning.get(iid)
     assert ims['msisdn']==replacement
-    assert 'sip:+'+replacement+'@'+REALM in [x['identity'] for x in ims['cx']['public_identities']]
+    assert 'sip:+'+replacement+'@'+REALM+';user=phone' in [x['identity'] for x in ims['cx']['public_identities']]
     from sqlalchemy import select
     from database import AUC
     with module.databaseClient.engine.connect() as c:assert c.scalar(select(AUC.ki).where(AUC.auc_id==saved['auc']['auc_id']))==payload['auc']['ki']
+
+def test_untracked_explicit_global_identity_remains_visible_for_operator_review(ui_client):
+    client,ui,module,d=ui_client;payload=bundle(d)
+    extra='sip:+'+digits(11)+'@'+REALM+';user=phone'
+    payload['ims_subscriber']['cx']['additional_public_identities']=[extra]
+    saved=module.cxProvisioning.create_service(payload);profile=saved['ims_subscriber']['cx']
+    profile.pop('provisioning')
+    module.cxProvisioning.repo.provision(saved['ims_subscriber']['ims_subscriber_id'],profile,replace=True)
+    page=client.get('/subscribers/'+str(saved['subscriber']['subscriber_id'])+'/edit').text
+    assert extra in page
+
+def test_ui_api_uses_discovered_endpoint_and_strict_mode_does_not_use_fixed_uri(ui_client,monkeypatch):
+    from service_discovery import ServiceEndpoint
+    client,ui,module,d=ui_client;seen=[]
+    monkeypatch.setattr(ui,'_DISCOVERY_CONFIG',{'require_discovery':True,'services':{'PYHSS_API':{'domain':REALM,'srv':'_api._tcp.'+REALM}}})
+    monkeypatch.setattr(ui.service_discovery,'resolve',lambda policy:ServiceEndpoint('api.'+REALM,54321,'tcp','http'))
+    opener=ui._API_OPENER
+    class Recording:
+        def open(self,request,timeout=None):seen.append(request.full_url);return opener.open(request,timeout=timeout)
+    monkeypatch.setattr(ui,'_API_OPENER',Recording())
+    _,options=ui.api('GET','provisioning/options')
+    assert options['authentication_methods'] and seen==['http://api.'+REALM+':54321/provisioning/options/']
+    with pytest.raises(ui.DiscoveryError,match='required for PCF_URI'):ui.service_url('PCF_URI')
+
+def test_ui_discovery_keeps_https_and_refuses_udp_for_http(ui_client,monkeypatch):
+    from service_discovery import ServiceEndpoint
+    client,ui,module,d=ui_client;seen=[]
+    monkeypatch.setattr(ui,'PCF_URI','https://configured.'+REALM)
+    monkeypatch.setattr(ui,'_DISCOVERY_CONFIG',{'services':{'PCF_URI':{'domain':REALM,'srv':'_pcf._tcp.'+REALM}}})
+    def resolve(policy):seen.append(policy);return ServiceEndpoint('pcf.'+REALM,54321,'tcp',policy['scheme'])
+    monkeypatch.setattr(ui.service_discovery,'resolve',resolve)
+    assert ui.service_url('PCF_URI').startswith('https://') and seen[0]['scheme']=='https'
+    monkeypatch.setattr(ui.service_discovery,'resolve',lambda policy:ServiceEndpoint('pcf.'+REALM,54321,'udp','https'))
+    with pytest.raises(ui.DiscoveryError,match='TCP discovery'):ui.service_url('PCF_URI')
