@@ -64,6 +64,109 @@ class APN(Base):
     last_modified = Column(String(100), default=datetime.datetime.now(tz=timezone.utc), doc='Timestamp of last modification')
     operation_logs = relationship("APN_OPERATION_LOG", back_populates="apn")
 
+
+# 5G / UDR / PCF extension models.  These deliberately use only portable
+# SQLAlchemy column types so they work with every SQL backend supported by PyHSS.
+class FIVEG_SLICE(Base):
+    __tablename__ = 'fiveg_slice'
+    subscriber_id = Column(Integer, ForeignKey('subscriber.subscriber_id', ondelete='CASCADE'), primary_key=True)
+    sst = Column(Integer, primary_key=True)
+    sd = Column(String(6), primary_key=True, default='')
+    is_default = Column(Boolean, nullable=False, default=False)
+
+class FIVEG_SLICE_APN(Base):
+    __tablename__ = 'fiveg_slice_apn'
+    subscriber_id = Column(Integer, ForeignKey('subscriber.subscriber_id', ondelete='CASCADE'), primary_key=True)
+    sst = Column(Integer, primary_key=True)
+    sd = Column(String(6), primary_key=True, default='')
+    apn_id = Column(Integer, ForeignKey('apn.apn_id', ondelete='CASCADE'), primary_key=True)
+    is_default = Column(Boolean, nullable=False, default=False)
+    session_ambr_ul = Column(BigInteger)
+    session_ambr_dl = Column(BigInteger)
+    five_qi = Column(Integer)
+    priority_level = Column(Integer)
+    arp_priority = Column(Integer)
+    preemption_capability = Column(Boolean)
+    preemption_vulnerability = Column(Boolean)
+    pdu_session_type = Column(String(16))
+    ssc_mode = Column(Integer)
+
+class FIVEG_AMF_REGISTRATION(Base):
+    __tablename__ = 'fiveg_amf_registration'
+    subscriber_id = Column(Integer, ForeignKey('subscriber.subscriber_id', ondelete='CASCADE'), primary_key=True)
+    amf_instance_id = Column(String(64), nullable=False)
+    dereg_callback_uri = Column(String(1024))
+    guami_mcc = Column(String(3)); guami_mnc = Column(String(3)); guami_amf_id = Column(String(16))
+    rat_type = Column(String(32)); access_type = Column(String(32)); pei = Column(String(128))
+    last_mcc = Column(String(3)); last_mnc = Column(String(3)); last_tac = Column(String(16))
+    last_nr_cell_id = Column(String(64)); last_gnb_id = Column(String(64))
+    raw_json = Column(Text, nullable=False, default='{}')
+    registered_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class FIVEG_SMF_REGISTRATION(Base):
+    __tablename__ = 'fiveg_smf_registration'
+    subscriber_id = Column(Integer, ForeignKey('subscriber.subscriber_id', ondelete='CASCADE'), primary_key=True)
+    pdu_session_id = Column(Integer, primary_key=True)
+    smf_instance_id = Column(String(64), nullable=False)
+    dnn = Column(String(100)); sst = Column(Integer); sd = Column(String(6)); plmn_mcc = Column(String(3)); plmn_mnc = Column(String(3))
+    access_type = Column(String(32)); raw_json = Column(Text, nullable=False, default='{}')
+    registered_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class QOS_PROFILE(Base):
+    __tablename__ = 'qos_profile'
+    id = Column(Integer, primary_key=True)
+    reference = Column(String(128), unique=True, nullable=False)
+    five_qi = Column(Integer, nullable=False); priority_level = Column(Integer); five_qi_priority_level = Column(Integer)
+    preempt_cap = Column(Boolean, nullable=False, default=False); preempt_vuln = Column(Boolean, nullable=False, default=True)
+    enabled = Column(Boolean, nullable=False, default=True)
+
+class PCC_RULE(Base):
+    __tablename__ = 'pcc_rule'
+    id = Column(Integer, primary_key=True); name = Column(String(128), unique=True, nullable=False)
+    qos_profile_id = Column(Integer, ForeignKey('qos_profile.id', ondelete='RESTRICT'), nullable=False)
+    precedence = Column(Integer, nullable=False, default=100)
+    maxbr_ul = Column(String(32)); maxbr_dl = Column(String(32)); gbr_ul = Column(String(32)); gbr_dl = Column(String(32))
+    enabled = Column(Boolean, nullable=False, default=True)
+
+class DNN_PCC_RULE(Base):
+    __tablename__ = 'dnn_pcc_rule'
+    id = Column(Integer, primary_key=True)
+    apn_id = Column(Integer, ForeignKey('apn.apn_id', ondelete='CASCADE'), nullable=False)
+    sst = Column(Integer, nullable=False); sd = Column(String(6), nullable=False, default='')
+    pcc_rule_id = Column(Integer, ForeignKey('pcc_rule.id', ondelete='CASCADE'), nullable=False)
+    __table_args__ = (UniqueConstraint('apn_id','sst','sd','pcc_rule_id', name='uq_dnn_pcc_rule'),)
+
+class SM_POLICY_ASSOCIATION(Base):
+    __tablename__ = 'sm_policy_association'
+    policy_id = Column(String(64), primary_key=True); supi = Column(String(64), nullable=False); gpsi = Column(String(64))
+    pdu_session_id = Column(Integer, nullable=False); dnn = Column(String(100), nullable=False); sst = Column(Integer, nullable=False); sd = Column(String(6))
+    ue_ipv4 = Column(String(64)); notification_uri = Column(String(1024), nullable=False); serving_nf_id = Column(String(64))
+    access_type = Column(String(32)); rat_type = Column(String(32)); owner_nf = Column(String(128))
+    request_json = Column(Text, nullable=False); decision_json = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now()); updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    __table_args__ = (UniqueConstraint('supi','pdu_session_id', name='uq_sm_policy_supi_pdu'),)
+
+class APP_SESSION(Base):
+    __tablename__ = 'app_session'
+    app_session_id = Column(String(64), primary_key=True); policy_id = Column(String(64), ForeignKey('sm_policy_association.policy_id', ondelete='CASCADE'), nullable=False)
+    ue_ipv4 = Column(String(64)); dnn = Column(String(100)); qos_reference = Column(String(128)); owner_nf = Column(String(128))
+    request_json = Column(Text, nullable=False); decision_json = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now()); updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+class PCF_META(Base):
+    __tablename__ = 'pcf_meta'; key = Column(String(128), primary_key=True); value = Column(Text, nullable=False)
+
+class CALLBACK_OUTBOX(Base):
+    __tablename__ = 'callback_outbox'
+    id = Column(Integer, primary_key=True); target = Column(String(1024), nullable=False); nf_type = Column(String(32)); service = Column(String(128))
+    payload = Column(Text, nullable=False); attempts = Column(Integer, nullable=False, default=0); due = Column(Float, nullable=False, default=0); last_error = Column(String(1024))
+
+class SPENDING_SUBSCRIPTION(Base):
+    __tablename__ = 'spending_subscription'
+    supi = Column(String(64), primary_key=True); location = Column(String(1024), nullable=False); notif_id = Column(String(128)); status_json = Column(Text, nullable=False, default='{}')
+
 class AUC(Base):
     __tablename__ = 'auc'
     auc_id = Column(Integer, primary_key = True, doc='Unique ID of AuC entry')
@@ -185,14 +288,6 @@ class IMS_SUBSCRIBER(Base):
     sh_template_path = Column(String(512), doc='Path to template file for the Sh Profile')
     last_modified = Column(String(100), default=datetime.datetime.now(tz=timezone.utc), doc='Timestamp of last modification')
     operation_logs = relationship("IMS_SUBSCRIBER_OPERATION_LOG", back_populates="ims_subscriber")
-
-class IMS_IDENTITY_BINDING(Base):
-    """Provisioned exact Cx identity association; never infer IMSI from URI."""
-    __tablename__ = 'ims_identity_binding'
-    binding_id = Column(Integer, primary_key=True)
-    ims_subscriber_id = Column(Integer, nullable=False, index=True)
-    impi = Column(String(512), nullable=False, index=True)
-    impu = Column(String(512), nullable=False, unique=True, index=True)
 
 class ROAMING_NETWORK(Base):
     __tablename__ = 'roaming_network'
@@ -1323,22 +1418,39 @@ class Database:
         self.safe_close(session)
         return result
 
-    def Get_IMS_Subscriber_By_Identity(self, impu, impi=None):
-        """Resolve a public identity and optionally enforce private/public binding."""
+    def Resolve_IMS_Public_Identity(self, identity):
+        """Resolve a provisioned SIP/TEL E.164 IMPU to an IMS subscription.
+
+        Compatibility bridge for legacy IMS_SUBSCRIBER.msisdn storage, where
+        numbers may be stored without '+'. Does not infer an IMPU from IMSI.
+        A future explicit IMPU/IMPI association model must supersede this.
+        """
+        import re
+        from sqlalchemy import or_
+        if not isinstance(identity, str):
+            raise ValueError("Invalid public identity")
+        value = identity.strip()
+        if value.lower().startswith('sip:') or value.lower().startswith('sips:'):
+            number = value.split(':', 1)[1].split('@', 1)[0]
+        elif value.lower().startswith('tel:'):
+            number = value[4:].split(';', 1)[0]
+        else:
+            raise ValueError("Unsupported IMPU scheme")
+        # Retain the leading + in the public identity. Legacy DB rows can
+        # contain digits only, so compare both exact E.164 and legacy form.
+        if not re.fullmatch(r'\+[1-9][0-9]{1,14}', number):
+            raise ValueError("IMPU is not an E.164 public identity")
         Session = sessionmaker(bind=self.engine)
         session = Session()
         try:
-            query = session.query(IMS_IDENTITY_BINDING).filter_by(impu=str(impu))
-            if impi is not None:
-                query = query.filter_by(impi=str(impi))
-            binding = query.one()
-            subscriber = session.query(IMS_SUBSCRIBER).filter_by(
-                ims_subscriber_id=binding.ims_subscriber_id).one()
-            result = dict(subscriber.__dict__)
-            result.pop('_sa_instance_state', None)
-            result['cx_impi'] = binding.impi
-            result['cx_impu'] = binding.impu
-            return self.Sanitize_Datetime(result)
+            rows = session.query(IMS_SUBSCRIBER).filter(
+                IMS_SUBSCRIBER.msisdn.in_([number, number[1:]])
+            ).all()
+            if len(rows) != 1:
+                raise ValueError("Unknown or ambiguous public identity")
+            data = dict(rows[0].__dict__)
+            data.pop('_sa_instance_state', None)
+            return self.Sanitize_Datetime(data)
         finally:
             self.safe_close(session)
 
