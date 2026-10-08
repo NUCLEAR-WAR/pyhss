@@ -7,6 +7,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import sys
 import json
+from datetime import date, datetime
+from decimal import Decimal
 from flask import Flask, request, jsonify, Response, redirect
 from flask_restx import Api, Resource, fields, reqparse, abort
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -2367,6 +2369,98 @@ class ProvisioningSnapshot(Resource):
     @auth_required
     def get(self):
         try:return cxProvisioning.snapshot(),200
+        except Exception as error:return handle_exception(error)
+
+def _cx_json_safe(value):
+    """Convert diagnostic data to Flask-RESTX JSON-safe primitives."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _cx_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_cx_json_safe(item) for item in value]
+    return value
+
+
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/audit/')
+class ProvisionCxAudit(Resource):
+    @auth_required
+    def get(self, ims_subscriber_id):
+        """Read-only ownership and identity-policy audit; no secrets or credential hashes."""
+        try:
+            repo = cxProvisioning.repo
+            with repo.engine.connect() as connection:
+                record = repo.record(ims_subscriber_id, connection)
+                definition = repo.definition(record, connection)
+                profile_row = connection.execute(sqlalchemy.select(repo.profiles.c.ims_subscriber_id).where(
+                    repo.profiles.c.ims_subscriber_id == ims_subscriber_id)).first()
+                groups = {}
+                private_ids = set(definition['private_identities'])
+                for public in definition['public_identities']:
+                    group = groups.setdefault(public['set_id'], {'public_identities': [], 'non_barred_count': 0})
+                    group['public_identities'].append({
+                        'identity': public['identity'],
+                        'barred': public['barred'],
+                        'can_register': public.get('can_register', True),
+                        'private_identities': public['private_identities']})
+                    group['non_barred_count'] += int(not public['barred'])
+                warnings = []
+                for name, group in groups.items():
+                    if not group['non_barred_count']:
+                        warnings.append('No unbarred IMPU in IRS ' + name)
+                    for item in group['public_identities']:
+                        if not set(item['private_identities']).issubset(private_ids):
+                            warnings.append('Unknown IMPI association in IRS ' + name)
+                return _cx_json_safe({
+                    'ims_subscriber_id': ims_subscriber_id,
+                    'owner_exists': True,
+                    'source': 'explicit' if profile_row else 'legacy_ifc',
+                    'private_identity_count': len(private_ids),
+                    'public_identity_count': len(definition['public_identities']),
+                    'registration_sets': groups,
+                    'warnings': warnings,
+                    'valid': not warnings,
+                    'note': 'Read-only configuration audit; does not prove S-CSCF Contact state or 3GPP interoperability.'
+                }), 200
+        except Exception as error:
+            return handle_exception(error)
+
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/')
+class ProvisionCxProfile(Resource):
+    @auth_required
+    def get(self,ims_subscriber_id):
+        """Read-only effective profile and SAA XML; never mutate Cx state."""
+        try:
+            repo=cxProvisioning.repo
+            with repo.engine.connect() as connection:
+                record=repo.record(ims_subscriber_id,connection)
+                profile={'record':record,'definition':repo.definition(record,connection)}
+                profile['public']=profile['definition']['public_identities'][0]
+                state=repo.state(profile,connection)
+                xml={}
+                for item in profile['definition']['public_identities']:
+                    if item['set_id'] not in xml:
+                        profile['public']=item
+                        xml[item['set_id']]=repo.user_data(profile)
+                return {'ims_subscriber_id':ims_subscriber_id,
+                        'source':'explicit' if connection.execute(
+                            sqlalchemy.select(repo.profiles.c.ims_subscriber_id).where(
+                            repo.profiles.c.ims_subscriber_id==ims_subscriber_id)).first() else 'legacy_ifc',
+                        'definition':profile['definition'],'state':_cx_json_safe(state),'saa_xml_by_set':xml},200
+        except Exception as error:return handle_exception(error)
+
+    @auth_required
+    def put(self,ims_subscriber_id):
+        """Replace an explicit Cx profile using native validation and locking."""
+        try:
+            body=request.get_json(force=True)
+            if not isinstance(body,dict) or not isinstance(body.get('definition'),dict):
+                raise ValueError('Expected JSON object with definition')
+            result=cxProvisioning.repo.provision(ims_subscriber_id,body['definition'],replace=True,
+                clear_authentication_pending=False)
+            return {'result':'OK','ims_subscriber_id':ims_subscriber_id,'definition':result},200
         except Exception as error:return handle_exception(error)
 
 @ns_provisioning.route('/subscriber/')
