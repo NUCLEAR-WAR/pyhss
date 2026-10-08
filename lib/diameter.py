@@ -3135,8 +3135,9 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Got MAR for public_identity : " + str(public_identity), redisClient=self.redisMessaging)
         username = self.get_avp_data(avps, 1)[0]
         username = binascii.unhexlify(username).decode('utf-8')
-        imsi = username.split('@')[0]   #Strip Domain
-        domain = username.split('@')[1] #Get Domain Part
+        # Cx User-Name is the IMPI; it is not an IMSI or an IMSI-derived URI.
+        imsi = None
+        domain = None
         self.logTool.log(service='HSS', level='debug', message="Got MAR username: " + str(username), redisClient=self.redisMessaging)
         auth_scheme = ''
 
@@ -3149,10 +3150,12 @@ class Diameter:
         avp += self.generate_avp(296, 40, self.OriginRealm)                                                   #Origin Realm        
 
         try:
-            subscriber_details = self.database.Get_Subscriber(imsi=imsi)                                               #Get subscriber details
+            ims_details = self.database.Get_IMS_Subscriber_By_Identity(impu=public_identity, impi=username)
+            imsi = ims_details['imsi']
+            subscriber_details = self.database.Get_Subscriber(imsi=imsi)
         except:
             #Handle if the subscriber is not present in HSS return "DIAMETER_ERROR_USER_UNKNOWN"
-            self.logTool.log(service='HSS', level='debug', message="Subscriber " + str(imsi) + " unknown in HSS for MAA", redisClient=self.redisMessaging)
+            self.logTool.log(service='HSS', level='debug', message="Subscriber " + str(username) + " unknown or unbound in HSS for MAA", redisClient=self.redisMessaging)
             self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
                                             metricType='counter', metricAction='inc', 
                                             metricValue=1.0, 
@@ -3160,7 +3163,7 @@ class Diameter:
                                                         "diameter_application_id": 16777216,
                                                         "diameter_cmd_code": 303,
                                                         "event": "Unknown User",
-                                                        "imsi_prefix": str(imsi[0:6])},
+                                                        "imsi_prefix": str(imsi or "unknown")[:6]},
                                             metricHelp='Diameter Authentication related Counters',
                                             metricExpiry=60,
                                             usePrefix=True, 
@@ -3194,7 +3197,7 @@ class Diameter:
                                                             "diameter_application_id": 16777216,
                                                             "diameter_cmd_code": 302,
                                                             "event": "ReAuth",
-                                                            "imsi_prefix": str(imsi[0:6])},
+                                                            "imsi_prefix": str(imsi or "unknown")[:6]},
                                                 metricHelp='Diameter Authentication related Counters',
                                                 metricExpiry=60,
                                                 usePrefix=True, 
@@ -3207,14 +3210,14 @@ class Diameter:
 
         self.logTool.log(service='HSS', level='debug', message="IMSI is " + str(imsi), redisClient=self.redisMessaging)        
         avp += self.generate_vendor_avp(601, "c0", 10415, str(binascii.hexlify(str.encode(public_identity)),'ascii'))               #Public Identity (IMSI)
-        avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(imsi + "@" + domain)),'ascii'))                                    #Username
+        avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(username)),'ascii'))                                    #Username
 
     
 
         #Determine Vectors to Generate
         if auth_scheme == "Digest-MD5":
             self.logTool.log(service='HSS', level='debug', message="Generating MD5 Challenge", redisClient=self.redisMessaging)
-            vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "Digest-MD5", username=imsi, plmn=plmn)
+            vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "Digest-MD5", username=username, plmn=plmn)
             avp_SIP_Item_Number = self.generate_vendor_avp(613, "c0", 10415, format(int(0),"x").zfill(8))
             avp_SIP_Authentication_Scheme = self.generate_vendor_avp(608, "c0", 10415, str(binascii.hexlify(b'Digest-MD5'),'ascii'))
             #Nonce
