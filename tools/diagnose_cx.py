@@ -11,7 +11,7 @@ from sqlalchemy import create_engine,inspect,select,text
 from sqlalchemy.exc import SQLAlchemyError
 from database import database_connection_settings
 from pyhss_config import config
-from cx_repository import CxRepository,CxError
+from cx_repository import CxRepository,CxError,private_key
 import jinja2
 import xml.etree.ElementTree as ET
 
@@ -48,6 +48,14 @@ def diagnose(engine,private=None,public=None,ifc_report=False):
             except (ValueError,ET.ParseError,jinja2.TemplateError) as error:
                 report[kind+'_identity']={'status':'profile_or_ifc_invalid','error_type':type(error).__name__}
         if private is not None and public is not None:
+            if 'public' in found and 'private' not in found:
+                try:
+                    profile=repo.resolve(public,private,c)
+                    if private_key(private) in profile['definition'].get('digest_identity_aliases',{}):
+                        found['private']=(profile['record'],profile['definition'])
+                        report['private_identity']={'status':'found','role':'digest_lookup_alias',
+                            'ims_subscriber_id':profile['record']['ims_subscriber_id']}
+                except (CxError,ValueError):pass
             if len(found)==2:
                 try:
                     profile=repo.resolve(public,private,c)

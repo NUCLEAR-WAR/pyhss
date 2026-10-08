@@ -76,17 +76,15 @@ class CxProvisioning:
         # Generated from provisioned fields, never derived from an incoming REGISTER.
         private=[primary];public=[];aliases={}
         for number in numbers(record):
-            # Calling identities are canonical. Digest lookup aliases below
-            # are private identities, not additional advertised public URIs.
-            for identity in ('sip:'+number+'@'+realm+';user=phone','tel:'+number):
+            # Match the operator's bare client identity. Digest bootstrap
+            # aliases below are metadata, not indexed authentication IMPIs.
+            for identity in ('sip:'+number+'@'+realm,'tel:'+number):
                 public.append({'identity':identity,'set_id':set_id})
             if mode!='aka':
                 for alias in (number+'@'+realm,number[1:]+'@'+realm):
                     if alias!=primary:
                         private.append(alias);aliases[alias]=primary
         private_public='sip:'+primary
-        private_user=primary.partition('@')[0]
-        if private_user.startswith('+') and private_user[1:].isascii() and private_user[1:].isdigit():private_public+=';user=phone'
         if not any(item['identity']==private_public for item in public):
             public.append({'identity':private_public,'set_id':set_id,'barred':policy.get('bar_private_impu',meta.get('bar_private_impu',True))})
         elif 'bar_private_impu' in policy:
@@ -157,6 +155,9 @@ class CxProvisioning:
         # Refuse a profile whose IFC cannot subsequently be returned in SAA.
         # Preserve operator-provisioned barring for existing identities.
         bars={item['identity']:item['barred'] for item in (existing or {}).get('public_identities',[])}
+        for identity in meta.get('managed_public',[]):
+            if identity.endswith(';user=phone') and identity in bars:
+                bars.setdefault(identity[:-len(';user=phone')],bars[identity])
         for item in result['public_identities']:
             generated_private=item['identity']==private_public
             override_private=generated_private and ('bar_private_impu' in policy or bool(meta))

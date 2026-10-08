@@ -56,8 +56,8 @@ def validate_provisioned_public_uri(identity,private_derived=False):
         phone_context=any(p.partition('=')[0].lower()=='phone-context' for p in user_parameters)
         if users==['phone']:
             validate_provisioned_public_uri('tel:'+user)
-        elif number.startswith('+') or phone_context or (number.isascii() and number.isdigit() and not private_derived and not users):
-            raise ValueError('SIP telephone public identity requires user=phone: '+identity)
+        # Bare SIP userinfo is provisioned as supplied, not rewritten into a
+        # telephone URI. An explicit user=phone URI still needs valid TEL form.
         return identity
     if not identity.startswith('tel:'):return identity
     number,*parameters=identity[4:].split(';')
@@ -229,6 +229,7 @@ class CxRepository:
 
     @staticmethod
     def authentication_schemes(profile):
+        if profile.get('private') in profile['definition'].get('digest_identity_aliases',{}):return ['SIP Digest']
         definition=profile['definition']
         value=definition.get('authentication_schemes',{}).get(profile.get('private'),definition['authentication_scheme'])
         return [value] if isinstance(value,str) else list(value)
@@ -276,7 +277,7 @@ class CxRepository:
             c.execute(delete(self.identities).where(self.identities.c.ims_subscriber_id==profile_id))
             if present:c.execute(update(self.profiles).where(self.profiles.c.ims_subscriber_id==profile_id).values(definition=json.dumps(d)))
             else:c.execute(self.profiles.insert().values(ims_subscriber_id=profile_id,definition=json.dumps(d)))
-            for kind,values in [('private',d['private_identities']),('public',[p['identity'] for p in d['public_identities']])]:
+            for kind,values in [('private',[identity for identity in d['private_identities'] if identity not in d.get('digest_identity_aliases',{})]),('public',[p['identity'] for p in d['public_identities']])]:
                 c.execute(self.identities.insert(),[{'identity':i,'kind':kind,'ims_subscriber_id':profile_id} for i in values])
         return d
 
@@ -300,15 +301,25 @@ class CxRepository:
         if len(matches)!=1:raise CxError(5012,False)
         return matches[0]
 
-    def resolve(self,public,private=None,c=None):
+    def resolve(self,public,private=None,c=None,canonical_private=False):
         if c is None:
-            with self.engine.connect() as conn:return self.resolve(public,private,conn)
+            with self.engine.connect() as conn:return self.resolve(public,private,conn,canonical_private)
         record,d=self.find(public,'public',c)
         item=next(x for x in d['public_identities'] if x['identity']==public_key(public))
         if private is not None:
-            private_record,_=self.find(private,'private',c)
-            if private_record['ims_subscriber_id']!=record['ims_subscriber_id'] or private_key(private) not in item['private_identities']:raise CxError(5002)
-        return {'record':record,'definition':d,'public':item,'private':private_key(private) if private else None}
+            try:requested=private_key(private)
+            except ValueError:raise CxError(5001,reason='invalid_private_identity_format')
+            target=d.get('digest_identity_aliases',{}).get(requested,requested)
+            if target!=requested:
+                # Compatibility names are scoped by a provisioned public
+                # profile, never by a global number search or a learned binding.
+                other=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==requested,self.identities.c.kind=='private')).first()
+                if other and other[0]!=record['ims_subscriber_id']:raise CxError(5002)
+                if requested not in item['private_identities']:raise CxError(5002)
+            private_record,_=self.find(target,'private',c)
+            if private_record['ims_subscriber_id']!=record['ims_subscriber_id'] or target not in item['private_identities']:raise CxError(5002)
+        return {'record':record,'definition':d,'public':item,
+                'private':(target if canonical_private else requested) if private is not None else None}
 
     def state(self,profile,c):
         ident=profile['record']['ims_subscriber_id']

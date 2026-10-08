@@ -110,7 +110,7 @@ def test_service_ui_edit_updates_cx_and_keeps_blank_credentials(ui_client):
     assert response.status_code==303,response.text
     ims=module.cxProvisioning.get(iid)
     assert ims['msisdn']==replacement
-    assert 'sip:+'+replacement+'@'+REALM+';user=phone' in [x['identity'] for x in ims['cx']['public_identities']]
+    assert 'sip:+'+replacement+'@'+REALM in [x['identity'] for x in ims['cx']['public_identities']]
     from sqlalchemy import select
     from database import AUC
     with module.databaseClient.engine.connect() as c:assert c.scalar(select(AUC.ki).where(AUC.auc_id==saved['auc']['auc_id']))==payload['auc']['ki']
