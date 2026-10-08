@@ -48,8 +48,6 @@ def diagnose(engine,private=None,public=None,ifc_report=False):
             except (ValueError,ET.ParseError,jinja2.TemplateError) as error:
                 report[kind+'_identity']={'status':'profile_or_ifc_invalid','error_type':type(error).__name__}
         if private is not None and public is not None:
-            # A Digest bootstrap alias has no private-kind index row. It is
-            # resolved only within the explicitly provisioned public profile.
             if 'public' in found and 'private' not in found:
                 try:
                     profile=repo.resolve(public,private,c)
@@ -75,6 +73,12 @@ def diagnose(engine,private=None,public=None,ifc_report=False):
                 except CxError as error:
                     report['identity_association']='mismatch' if error.code==5002 else 'lookup_rejected'
             else:report['identity_association']='cannot_validate_missing_identity'
+        if 'public' in found:
+            profile=repo.resolve(public,c=c);state=repo.state(profile,c)
+            report['unregistered_service_policy']=repo.unregistered_service_policy(profile['definition'])
+            report['unregistered_service_effective']=repo.terminating_unregistered_service(profile)
+            report['assigned_scscf']=state['scscf']
+            report['public_registration_state']=repo.group(state,profile['public']['set_id'])['state']
         if ifc_report:
             explicit=set(c.execute(select(repo.profiles.c.ims_subscriber_id)).scalars())
             issues=[];checked=0

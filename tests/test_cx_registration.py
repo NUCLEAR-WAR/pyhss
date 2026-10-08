@@ -55,6 +55,7 @@ def lab(tmp_path,monkeypatch):
     monkeypatch.setitem(config['hss'],'MNC',TEST_MNC)
     monkeypatch.setitem(config['hss'],'OriginHost','hss.'+REALM)
     monkeypatch.setitem(config['hss'],'OriginRealm',REALM)
+    monkeypatch.setitem(config['hss'],'scscf_pool',[])
     monkeypatch.setitem(config['hss'],'cx',{'server_capabilities':{'mandatory':[0],'optional':[1]}})
     db=Database(NullLog(),redisMessaging=NullRedis(),main_service=True)
     apn=db.CreateObj(APN,{'apn':'ims','apn_ambr_ul':1000000,'apn_ambr_dl':1000000},disable_logging=True)

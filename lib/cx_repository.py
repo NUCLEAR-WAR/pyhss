@@ -56,8 +56,8 @@ def validate_provisioned_public_uri(identity,private_derived=False):
         phone_context=any(p.partition('=')[0].lower()=='phone-context' for p in user_parameters)
         if users==['phone']:
             validate_provisioned_public_uri('tel:'+user)
-        # Unmarked SIP userinfo is an explicitly provisioned SIP username.
-        # Do not force phone interpretation or append parameters in DB keys.
+        # Bare SIP userinfo is provisioned as supplied, not rewritten into a
+        # telephone URI. An explicit user=phone URI still needs valid TEL form.
         return identity
     if not identity.startswith('tel:'):return identity
     number,*parameters=identity[4:].split(';')
@@ -155,6 +155,56 @@ class CxRepository:
         values.update(mcc=mcc,mnc=mnc.zfill(3))
         return ET.fromstring(env.get_template(path).render(iFC_vars=values))
 
+    @staticmethod
+    def ifc_has_terminating_unregistered_service(root):
+        """Could an active iFC apply to INVITE / TERMINATING_UNREGISTERED?
+
+        Method/session case are known. Header/URI/SDP conditions may match a
+        call and are treated as possible, respecting the iFC CNF/DNF groups.
+        This discovers provisioned service eligibility, not an S-CSCF trigger.
+        """
+        def boolean(value):
+            if value in ('0','false'):return False
+            if value in ('1','true'):return True
+            raise ValueError('Invalid IFC boolean')
+        for rule in root.findall('./ServiceProfile/InitialFilterCriteria'):
+            if rule.findtext('ProfilePartIndicator')=='0':continue
+            if not rule.findtext('./ApplicationServer/ServerName'):continue
+            trigger=rule.find('TriggerPoint')
+            if trigger is None:return True
+            cnf=boolean(trigger.findtext('ConditionTypeCNF','0'))
+            groups={}
+            for item in trigger.findall('SPT'):
+                value=None
+                if item.find('Method') is not None:value=item.findtext('Method')=='INVITE'
+                elif item.find('SessionCase') is not None:value=item.findtext('SessionCase')=='2'
+                if boolean(item.findtext('ConditionNegated','0')) and value is not None:value=not value
+                members=item.findall('Group')
+                if not members:raise ValueError('IFC SPT requires a group')
+                for group in members:groups.setdefault(group.text,[]).append(value)
+            if not groups:continue
+            # Unknown predicates can match; impossible known predicates cannot.
+            possible=[any(value is not False for value in values) if cnf else all(value is not False for value in values)
+                for values in groups.values()]
+            if (all(possible) if cnf else any(possible)):return True
+        return False
+
+    @staticmethod
+    def unregistered_service_policy(definition):
+        mode=definition.get('unregistered_service_policy')
+        if mode is not None:
+            if mode not in ('auto','enabled','disabled'):raise ValueError('Invalid unregistered service policy')
+            return mode
+        # The older auto-provisioner always wrote false without reading IFC.
+        # Only those identifiable generated profiles inherit the IFC default.
+        if definition.get('provisioning') and not definition.get('unregistered_service',False):return 'auto'
+        return 'enabled' if definition.get('unregistered_service',False) else 'disabled'
+
+    def terminating_unregistered_service(self,profile):
+        mode=self.unregistered_service_policy(profile['definition'])
+        if mode!='auto':return mode=='enabled'
+        return self.ifc_has_terminating_unregistered_service(ET.fromstring(self.user_data(profile)))
+
     def legacy_profile(self,record):
         root=self.xml(record);private=root.findtext('PrivateID')
         if not private:raise ValueError('IFC must contain a provisioned PrivateID')
@@ -164,7 +214,8 @@ class CxRepository:
             if identity:public.append({'identity':identity,'set_id':'default','barred':element.findtext('BarringIndication','0')=='1'})
         return {'private_identities':[private],'public_identities':public,
                 'authentication_scheme':'Digest-AKAv1-MD5','digest_realm':private.rpartition('@')[2],
-                'unregistered_service':False}
+                'unregistered_service':self.ifc_has_terminating_unregistered_service(root),
+                'unregistered_service_policy':'auto'}
 
     def definition(self,record,c):
         row=c.execute(select(self.profiles.c.definition).where(self.profiles.c.ims_subscriber_id==record['ims_subscriber_id'])).first()
@@ -221,7 +272,16 @@ class CxRepository:
         d.setdefault('digest_realm',d['private_identities'][0].rpartition('@')[2])
         if not isinstance(d['digest_realm'],str) or not d['digest_realm']:raise ValueError('Digest realm must be provisioned')
         d.setdefault('unregistered_service',False)
+        if type(d['unregistered_service']) is not bool:raise ValueError('unregistered_service must be a boolean')
+        if 'unregistered_service_policy' in d and d['unregistered_service_policy'] not in ('auto','enabled','disabled'):
+            raise ValueError('Invalid unregistered service policy')
+        CxRepository.unregistered_service_policy(d)
         return d
+
+    @staticmethod
+    def default_authentication_identity(profile):
+        aliases=profile['definition'].get('digest_identity_aliases',{})
+        return next(identity for identity in profile['public']['private_identities'] if identity not in aliases)
 
     @staticmethod
     def authentication_scheme(profile):
@@ -229,8 +289,8 @@ class CxRepository:
 
     @staticmethod
     def authentication_schemes(profile):
+        if profile.get('private') in profile['definition'].get('digest_identity_aliases',{}):return ['SIP Digest']
         definition=profile['definition']
-        if profile.get('private') in definition.get('digest_identity_aliases',{}):return ['SIP Digest']
         value=definition.get('authentication_schemes',{}).get(profile.get('private'),definition['authentication_scheme'])
         return [value] if isinstance(value,str) else list(value)
 
@@ -253,6 +313,16 @@ class CxRepository:
             d=self.prepare_definition(record,definition)
             present=c.execute(select(self.profiles).where(self.profiles.c.ims_subscriber_id==profile_id)).first()
             if present and not replace:raise ValueError('Cx profile exists; use explicit replacement')
+            if present and not clear_authentication_pending:
+                current=self.validate_definition(json.loads(present._mapping['definition']))
+                before=deepcopy(current);after=deepcopy(d)
+                for field in ('unregistered_service','unregistered_service_policy'):
+                    before.pop(field,None);after.pop(field,None)
+                if before==after and current!=d:
+                    # Routing-policy-only edit: do not rebuild the identity index
+                    # or disturb an assigned/registered subscriber's runtime state.
+                    c.execute(update(self.profiles).where(self.profiles.c.ims_subscriber_id==profile_id).values(definition=json.dumps(d)))
+                    return d
             state=c.execute(select(self.states).where(self.states.c.ims_subscriber_id==profile_id)).mappings().first()
             clear_pending=False
             if state and state['scscf']:
@@ -265,10 +335,9 @@ class CxRepository:
                 clear_pending=True
             if not state and record.get('scscf') and record.get('scscf_timestamp'):raise ValueError('De-register the legacy active subscription before changing its Cx profile')
             for kind,identities in [('private',d['private_identities']),('public',[p['identity'] for p in d['public_identities']])]:
-                other=c.execute(select(self.identities.c.ims_subscriber_id).where(
-                    self.identities.c.identity.in_(identities),self.identities.c.kind==kind,
-                    self.identities.c.ims_subscriber_id!=profile_id)).first()
-                if other:raise ValueError('Identity already provisioned under another subscription')
+                for identity in identities:
+                    other=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==identity,self.identities.c.kind==kind)).first()
+                    if other and other[0]!=profile_id:raise ValueError('Identity already provisioned under another subscription')
             if clear_pending:
                 # This is an explicit OAM operation in the profile transaction.
                 # SQN and native AuC/subscriber data are never reset here.
@@ -285,20 +354,15 @@ class CxRepository:
     def find(self,identity,kind,c):
         try:key=private_key(identity) if kind=='private' else public_key(identity)
         except ValueError:raise CxError(5001,reason='invalid_'+kind+'_identity_format')
-        explicit=c.execute(select(self.ims,self.profiles.c.definition).select_from(
-            self.identities.join(self.ims,self.identities.c.ims_subscriber_id==self.ims.c.ims_subscriber_id)
-            .join(self.profiles,self.profiles.c.ims_subscriber_id==self.ims.c.ims_subscriber_id))
-            .where(self.identities.c.identity==key,self.identities.c.kind==kind)).mappings().first()
+        explicit=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==key,self.identities.c.kind==kind)).first()
         if explicit:
-            record=dict(explicit);definition=record.pop('definition')
-            return record,self.validate_definition(json.loads(definition))
+            record=self.record(explicit[0],c);return record,self.definition(record,c)
         matches=[]
         # Legacy transition: use provisioned XML, not numeric length or a request's realm.
-        records=c.execute(select(self.ims).select_from(self.ims.outerjoin(
-            self.profiles,self.profiles.c.ims_subscriber_id==self.ims.c.ims_subscriber_id))
-            .where(self.profiles.c.ims_subscriber_id.is_(None))).mappings().all()
+        records=c.execute(select(self.ims)).mappings().all()
         for row in records:
             record=dict(row)
+            if c.execute(select(self.profiles.c.ims_subscriber_id).where(self.profiles.c.ims_subscriber_id==record['ims_subscriber_id'])).first():continue
             try:d=self.validate_definition(self.legacy_profile(record))
             except (ValueError,ET.ParseError,jinja2.TemplateError):continue
             values=d['private_identities'] if kind=='private' else [p['identity'] for p in d['public_identities']]
@@ -307,20 +371,25 @@ class CxRepository:
         if len(matches)!=1:raise CxError(5012,False)
         return matches[0]
 
-    def resolve(self,public,private=None,c=None):
+    def resolve(self,public,private=None,c=None,canonical_private=False):
         if c is None:
-            with self.engine.connect() as conn:return self.resolve(public,private,conn)
+            with self.engine.connect() as conn:return self.resolve(public,private,conn,canonical_private)
         record,d=self.find(public,'public',c)
         item=next(x for x in d['public_identities'] if x['identity']==public_key(public))
         if private is not None:
-            requested=private_key(private);target=d.get('digest_identity_aliases',{}).get(requested,requested)
+            try:requested=private_key(private)
+            except ValueError:raise CxError(5001,reason='invalid_private_identity_format')
+            target=d.get('digest_identity_aliases',{}).get(requested,requested)
             if target!=requested:
+                # Compatibility names are scoped by a provisioned public
+                # profile, never by a global number search or a learned binding.
                 other=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==requested,self.identities.c.kind=='private')).first()
                 if other and other[0]!=record['ims_subscriber_id']:raise CxError(5002)
                 if requested not in item['private_identities']:raise CxError(5002)
             private_record,_=self.find(target,'private',c)
             if private_record['ims_subscriber_id']!=record['ims_subscriber_id'] or target not in item['private_identities']:raise CxError(5002)
-        return {'record':record,'definition':d,'public':item,'private':private_key(private) if private else None}
+        return {'record':record,'definition':d,'public':item,
+                'private':(target if canonical_private else requested) if private is not None else None}
 
     def state(self,profile,c):
         ident=profile['record']['ims_subscriber_id']

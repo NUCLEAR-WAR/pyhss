@@ -56,6 +56,8 @@ class CxProvisioning:
         policy.pop('clear_authentication_pending',None)
         for field in ('bar_private_impu','unregistered_service'):
             if field in policy and type(policy[field]) is not bool:raise ValueError('cx.'+field+' must be a boolean')
+        if 'unregistered_service_policy' in policy and policy['unregistered_service_policy'] not in ('auto','enabled','disabled'):
+            raise ValueError('cx.unregistered_service_policy must be auto, enabled or disabled')
         if 'private_identities' in policy:
             self.repo.xml(record)
             return self.repo.prepare_definition(record,policy)
@@ -76,8 +78,8 @@ class CxProvisioning:
         # Generated from provisioned fields, never derived from an incoming REGISTER.
         private=[primary];public=[];aliases={}
         for number in numbers(record):
-            # Keep the requested client-compatible SIP form in the DB. Digest
-            # lookup aliases are metadata, not indexed authentication IMPIs.
+            # Match the operator's bare client identity. Digest bootstrap
+            # aliases below are metadata, not indexed authentication IMPIs.
             for identity in ('sip:'+number+'@'+realm,'tel:'+number):
                 public.append({'identity':identity,'set_id':set_id})
             if mode!='aka':
@@ -92,6 +94,11 @@ class CxProvisioning:
         private=list(dict.fromkeys(private))
         for item in public:item['private_identities']=list(private)
         allowed=['Digest-AKAv1-MD5','SIP Digest'] if mode=='dual' else ['SIP Digest'] if mode=='sip_digest' else ['Digest-AKAv1-MD5']
+        if 'unregistered_service_policy' in policy:unregistered_mode=policy['unregistered_service_policy']
+        elif 'unregistered_service' in policy:unregistered_mode='enabled' if policy['unregistered_service'] else 'disabled'
+        elif existing is not None:unregistered_mode=self.repo.unregistered_service_policy(existing)
+        else:unregistered_mode='auto'
+        unregistered=self.repo.ifc_has_terminating_unregistered_service(self.repo.xml(record)) if unregistered_mode=='auto' else unregistered_mode=='enabled'
         extra=policy.get('additional_public_identities',meta.get('additional_public_identities',[]))
         if not isinstance(extra,list):raise ValueError('cx.additional_public_identities must be a list of full public URIs or identity objects')
         explicit=[]
@@ -109,7 +116,7 @@ class CxProvisioning:
             'authentication_scheme':allowed[0],'authentication_schemes':{identity:allowed if identity==primary else 'SIP Digest' for identity in private},
             'digest_realm':policy.get('digest_realm') or realm,
             'visited_networks':policy.get('visited_networks') or (existing or {}).get('visited_networks') or [realm],
-            'digest_identity_aliases':aliases,'unregistered_service':policy.get('unregistered_service',(existing or {}).get('unregistered_service',False)),
+            'digest_identity_aliases':aliases,'unregistered_service':unregistered,'unregistered_service_policy':unregistered_mode,
             'service_type':policy.get('service_type') or (existing or {}).get('service_type') or ('fixed_voice' if mode=='sip_digest' else 'mobile_voice_data'),
             'provisioning':{'authentication':mode,'realm':realm,'set_id':set_id,'private_identity':primary,
                 'custom_private_identity':bool(policy.get('private_identity') or meta.get('custom_private_identity')),
@@ -155,7 +162,6 @@ class CxProvisioning:
         # Refuse a profile whose IFC cannot subsequently be returned in SAA.
         # Preserve operator-provisioned barring for existing identities.
         bars={item['identity']:item['barred'] for item in (existing or {}).get('public_identities',[])}
-        # Restoring a managed marked SIP URI must retain its barring policy.
         for identity in meta.get('managed_public',[]):
             if identity.endswith(';user=phone') and identity in bars:
                 bars.setdefault(identity[:-len(';user=phone')],bars[identity])
@@ -203,7 +209,19 @@ class CxProvisioning:
         self._log(session,operation_id)
         record=self.record(obj)
         identity_changed=previous is None or any(previous.get(key)!=record.get(key) for key in ('imsi','msisdn','msisdn_list','ifc_path'))
-        desired=existing if existing and policy is None and not identity_changed else self.definition(record,policy,existing,previous)
+        route_fields={'unregistered_service','unregistered_service_policy'}
+        if existing and not identity_changed and policy and set(policy)<=route_fields:
+            if 'unregistered_service' in policy and type(policy['unregistered_service']) is not bool:
+                raise ValueError('cx.unregistered_service must be a boolean')
+            desired=deepcopy(existing)
+            mode=policy.get('unregistered_service_policy')
+            if mode is None:
+                if type(policy['unregistered_service']) is not bool:raise ValueError('cx.unregistered_service must be a boolean')
+                mode='enabled' if policy['unregistered_service'] else 'disabled'
+            if mode not in ('auto','enabled','disabled'):raise ValueError('Invalid unregistered service policy')
+            desired['unregistered_service_policy']=mode
+            desired['unregistered_service']=self.repo.ifc_has_terminating_unregistered_service(self.repo.xml(record)) if mode=='auto' else mode=='enabled'
+        else:desired=existing if existing and policy is None and not identity_changed else self.definition(record,policy,existing,previous)
         if existing!=desired or (policy or {}).get('clear_authentication_pending'):
             try:self.repo.provision(obj.ims_subscriber_id,desired,replace=bool(existing),
                     clear_authentication_pending=bool((policy or {}).get('clear_authentication_pending')),connection=c)
