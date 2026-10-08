@@ -2369,6 +2369,42 @@ class ProvisioningSnapshot(Resource):
         try:return cxProvisioning.snapshot(),200
         except Exception as error:return handle_exception(error)
 
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/')
+class ProvisionCxProfile(Resource):
+    @auth_required
+    def get(self,ims_subscriber_id):
+        """Read-only effective profile and SAA XML; never mutate Cx state."""
+        try:
+            repo=cxProvisioning.repo
+            with repo.engine.connect() as connection:
+                record=repo.record(ims_subscriber_id,connection)
+                profile={'record':record,'definition':repo.definition(record,connection)}
+                profile['public']=profile['definition']['public_identities'][0]
+                state=repo.state(profile,connection)
+                xml={}
+                for item in profile['definition']['public_identities']:
+                    if item['set_id'] not in xml:
+                        profile['public']=item
+                        xml[item['set_id']]=repo.user_data(profile)
+                return {'ims_subscriber_id':ims_subscriber_id,
+                        'source':'explicit' if connection.execute(
+                            sqlalchemy.select(repo.profiles.c.ims_subscriber_id).where(
+                            repo.profiles.c.ims_subscriber_id==ims_subscriber_id)).first() else 'legacy_ifc',
+                        'definition':profile['definition'],'state':state,'saa_xml_by_set':xml},200
+        except Exception as error:return handle_exception(error)
+
+    @auth_required
+    def put(self,ims_subscriber_id):
+        """Replace an explicit Cx profile using native validation and locking."""
+        try:
+            body=request.get_json(force=True)
+            if not isinstance(body,dict) or not isinstance(body.get('definition'),dict):
+                raise ValueError('Expected JSON object with definition')
+            result=cxProvisioning.repo.provision(ims_subscriber_id,body['definition'],replace=True,
+                clear_authentication_pending=False)
+            return {'result':'OK','ims_subscriber_id':ims_subscriber_id,'definition':result},200
+        except Exception as error:return handle_exception(error)
+
 @ns_provisioning.route('/subscriber/')
 class ProvisionSubscriberService(Resource):
     def put(self):
