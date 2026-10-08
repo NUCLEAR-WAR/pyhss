@@ -97,6 +97,10 @@ class CxService:
             code,payload,experimental=method(avps)
             return self.answer(packet,avps,code,payload,experimental)
         except CxError as error:
+            if error.reason:
+                self.d.logTool.log(service='HSS',level='warning',
+                    message=f'Cx {packet["command_code"]} rejected: {error.reason}; result={error.code}; experimental={error.experimental}',
+                    redisClient=self.d.redisMessaging)
             return self.answer(packet,avps,error.code,self.server(error.server_name) if error.server_name else '',error.experimental,error.failed_avp)
         except Exception as error:
             # Backend/profile failures never become success or mutate partial state.
@@ -134,12 +138,13 @@ class CxService:
         return 2001,self.capabilities(),True
 
     def authentication_scheme(self,profile,requested):
-        provisioned=profile['definition']['authentication_scheme']
-        if requested=='Unknown':
-            if provisioned!='SIP Digest':raise CxError(5006)
-            return provisioned
+        allowed=self.repo.authentication_schemes(profile)
+        if requested in ('Unknown','unknown'):
+            if 'SIP Digest' not in allowed:raise CxError(5006,reason='unknown_scheme_cannot_select_aka')
+            return 'SIP Digest'
         if requested=='Digest-MD5' and self.settings.get('accept_legacy_digest_md5',False):requested='SIP Digest'
-        if requested!=provisioned or requested not in ('SIP Digest','Digest-AKAv1-MD5'):raise CxError(5006)
+        if requested not in allowed or requested not in ('SIP Digest','Digest-AKAv1-MD5'):
+            raise CxError(5006,reason='requested_authentication_scheme_mismatches_profile')
         return requested
 
     def mar(self,avps):

@@ -32,6 +32,28 @@ import traceback
 from pyhss_config import config
 
 
+def database_connection_settings(db_cfg):
+    """Shared native connection settings for services and read-only diagnostics."""
+    from sqlalchemy.engine import URL
+    db_type = str(db_cfg['db_type']).lower()
+    if db_type == 'sqlite':
+        db_string = URL.create('sqlite', database=str(db_cfg['database']))
+    elif db_type in ('mysql', 'mariadb', 'postgresql'):
+        driver = 'postgresql+psycopg2' if db_type == 'postgresql' else 'mysql+pymysql'
+        server = str(db_cfg['server']); port = db_cfg.get('port')
+        if server.count(':') == 1:
+            server, server_port = server.split(':'); port = port or server_port
+        db_string = URL.create(driver, username=str(db_cfg['username']), password=str(db_cfg['password']),
+            host=server, port=int(port) if port else None, database=str(db_cfg['database']))
+    else:
+        raise RuntimeError(f'Invalid database.db_type set "{db_type}"')
+    connect_args = {}
+    if db_type in ('mysql', 'mariadb') and 'ssl_disabled' in db_cfg:
+        if type(db_cfg['ssl_disabled']) is not bool:
+            raise ValueError('database.ssl_disabled must be a YAML boolean')
+        connect_args['ssl_disabled'] = db_cfg['ssl_disabled']
+    return db_string, connect_args
+
 Base = declarative_base()
 
 class DATABASE_SCHEMA_VERSION(Base):
@@ -486,25 +508,13 @@ class Database:
         else:
             self.redisMessaging = RedisMessaging(host=self.redisHost, port=self.redisPort, useUnixSocket=self.redisUseUnixSocket, unixSocketPath=self.redisUnixSocketPath)
 
-        from sqlalchemy.engine import URL
-        db_cfg = config['database']
-        db_type = str(db_cfg['db_type']).lower()
-        if db_type == 'sqlite':
-            db_string = URL.create('sqlite', database=str(db_cfg['database']))
-        elif db_type in ('mysql', 'mariadb', 'postgresql'):
-            driver = 'postgresql+psycopg2' if db_type == 'postgresql' else 'mysql+pymysql'
-            server = str(db_cfg['server']); port = db_cfg.get('port')
-            if server.count(':') == 1:
-                server, server_port = server.split(':'); port = port or server_port
-            db_string = URL.create(driver, username=str(db_cfg['username']), password=str(db_cfg['password']),
-                host=server, port=int(port) if port else None, database=str(db_cfg['database']))
-        else:
-            raise RuntimeError(f'Invalid database.db_type set "{db_type}"')
+        db_string, connect_args = database_connection_settings(config['database'])
 
         self.hostname = socket.gethostname()        
         
         self.engine = create_engine(
-            db_string, 
+            db_string,
+            connect_args=connect_args,
             echo = config['logging'].get('sqlalchemy_sql_echo', False), 
             pool_recycle=config['logging'].get('sqlalchemy_pool_recycle', 5),
             pool_size=config['logging'].get('sqlalchemy_pool_size', 30),

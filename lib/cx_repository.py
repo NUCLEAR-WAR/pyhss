@@ -20,9 +20,9 @@ from sqlalchemy.dialects.mysql import VARCHAR
 import time
 
 class CxError(Exception):
-    def __init__(self,code,experimental=True,failed_avp=None,server_name=None):
+    def __init__(self,code,experimental=True,failed_avp=None,server_name=None,reason=None):
         self.code=code;self.experimental=experimental;self.failed_avp=failed_avp
-        self.server_name=server_name
+        self.server_name=server_name;self.reason=reason
         super().__init__(f'Cx result {code}')
 
 def public_key(identity):
@@ -46,7 +46,7 @@ def private_key(identity):
     return user+'@'+realm.lower()
 
 class CxRepository:
-    def __init__(self,database,config,root=None):
+    def __init__(self,database,config,root=None,initialize_schema=True):
         from database import IMS_SUBSCRIBER,SUBSCRIBER,AUC
         self.db=database;self.engine=database.engine;self.config=config
         self.settings=config.get('hss',{}).get('cx',{})
@@ -64,6 +64,7 @@ class CxRepository:
             Column('scscf',String(512)),Column('realm',String(255)),Column('peer',String(512)),
             Column('groups_json',Text,nullable=False),Column('registered_at',DateTime),
             Column('updated_at',DateTime,nullable=False))
+        if not initialize_schema:return
         # Startup-only additive DDL, never a migration of provisioned identities.
         for attempt in range(4):
             try:
@@ -93,7 +94,7 @@ class CxRepository:
 
     def record(self,ident,c):
         row=c.execute(select(self.ims).where(self.ims.c.ims_subscriber_id==ident)).mappings().first()
-        if row is None:raise CxError(5001)
+        if row is None:raise CxError(5001,reason='ims_subscription_not_found')
         return dict(row)
 
     def network_codes(self):
@@ -150,10 +151,30 @@ class CxRepository:
             if sets.setdefault(item['set_id'],associations)!=associations:raise ValueError('Implicitly registered identities must have consistent private associations')
         d.setdefault('authentication_scheme','Digest-AKAv1-MD5')
         if d['authentication_scheme'] not in ('Digest-AKAv1-MD5','SIP Digest'):raise ValueError('Unsupported provisioned authentication scheme')
+        schemes=d.get('authentication_schemes',{})
+        if not isinstance(schemes,dict):raise ValueError('authentication_schemes must map private identities to schemes')
+        d['authentication_schemes']={private_key(identity):scheme for identity,scheme in schemes.items()}
+        if not set(d['authentication_schemes'])<=set(d['private_identities']):raise ValueError('Authentication policy references an unprovisioned private identity')
+        for schemes in d['authentication_schemes'].values():
+            allowed=[schemes] if isinstance(schemes,str) else schemes
+            if not isinstance(allowed,list) or not allowed or len(allowed)!=len(set(allowed)):
+                raise ValueError('Private authentication policy must contain distinct scheme names')
+            if any(scheme not in ('Digest-AKAv1-MD5','SIP Digest') for scheme in allowed):
+                raise ValueError('Unsupported private identity authentication scheme')
         d.setdefault('digest_realm',d['private_identities'][0].rpartition('@')[2])
         if not isinstance(d['digest_realm'],str) or not d['digest_realm']:raise ValueError('Digest realm must be provisioned')
         d.setdefault('unregistered_service',False)
         return d
+
+    @staticmethod
+    def authentication_scheme(profile):
+        return CxRepository.authentication_schemes(profile)[0]
+
+    @staticmethod
+    def authentication_schemes(profile):
+        definition=profile['definition']
+        value=definition.get('authentication_schemes',{}).get(profile.get('private'),definition['authentication_scheme'])
+        return [value] if isinstance(value,str) else list(value)
 
     def provision(self,profile_id,definition,replace=False):
         d=self.validate_definition(definition)
@@ -177,7 +198,7 @@ class CxRepository:
 
     def find(self,identity,kind,c):
         try:key=private_key(identity) if kind=='private' else public_key(identity)
-        except ValueError:raise CxError(5001)
+        except ValueError:raise CxError(5001,reason='invalid_'+kind+'_identity_format')
         explicit=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==key,self.identities.c.kind==kind)).first()
         if explicit:
             record=self.record(explicit[0],c);return record,self.definition(record,c)
@@ -191,7 +212,7 @@ class CxRepository:
             except (ValueError,ET.ParseError,jinja2.TemplateError):continue
             values=d['private_identities'] if kind=='private' else [p['identity'] for p in d['public_identities']]
             if key in values:matches.append((record,d))
-        if not matches:raise CxError(5001)
+        if not matches:raise CxError(5001,reason=kind+'_identity_not_provisioned')
         if len(matches)!=1:raise CxError(5012,False)
         return matches[0]
 
@@ -242,9 +263,9 @@ class CxRepository:
 
     def credential(self,profile,c):
         subscriber=c.execute(select(self.sub).where(self.sub.c.imsi==profile['record']['imsi'])).mappings().first()
-        if not subscriber:raise CxError(5001)
+        if not subscriber:raise CxError(5001,reason='native_subscriber_not_found')
         auc=c.execute(select(self.auc).where(self.auc.c.auc_id==subscriber['auc_id']).with_for_update()).mappings().first()
-        if not auc:raise CxError(5001)
+        if not auc:raise CxError(5001,reason='native_auc_not_found')
         return dict(subscriber),dict(auc)
 
     def user_data(self,profile,private=None):

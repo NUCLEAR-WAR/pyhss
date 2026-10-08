@@ -7,15 +7,18 @@ and restart the PyHSS services. Your existing native subscriber and AuC records
 remain the source of credentials; Cx uses the configured PyHSS SQLAlchemy engine.
 The supplied archive's native UDR/PCF model additions are retained.
 
-Alternatively, apply the accompanying `pyhss-cx-repo-ready.patch` from your fork:
+Alternatively, apply `pyhss-cx-lab-debug.patch` from the original supplied PyHSS
+fork, or `pyhss-cx-lab-debug-update.patch` if the previous repo-ready package is
+already applied:
 
 ```sh
-git apply --check /path/to/pyhss-cx-repo-ready.patch
-git apply /path/to/pyhss-cx-repo-ready.patch
+git apply --check /path/to/pyhss-cx-lab-debug.patch
+git apply /path/to/pyhss-cx-lab-debug.patch
 python -m pip install -r requirements.txt
 ```
 
-The patch is checked against the supplied `pyhss-master (1).zip`. If your fork
+The full patch is checked against `pyhss-master (1).zip`, and the update patch
+against the previous `pyhss-cx-repo-ready.zip` package. If your fork
 has additional changes in these files, review the diff before replacing them.
 This changes-only package is intended for that PyHSS fork, rather than the
 separate merged IMS lab whose database extension differs.
@@ -42,7 +45,8 @@ Create your own profile JSON with these fields:
 |---|---|
 | `private_identities` | List of exact full private identities, including the home realm |
 | `public_identities` | List of objects with `identity`, `set_id` and `barred` |
-| `authentication_scheme` | `SIP Digest` for fixed Digest authentication or `Digest-AKAv1-MD5` for AKA |
+| `authentication_scheme` | Default provisioned scheme: `SIP Digest` or `Digest-AKAv1-MD5` |
+| `authentication_schemes` | Optional map from full private identity to a scheme or an explicit list of allowed schemes |
 | `digest_realm` | The provisioned authentication realm |
 | `visited_networks` | List of permitted visited network identifiers |
 | `unregistered_service` | Boolean indicating provisioned unregistered service policy |
@@ -97,9 +101,162 @@ A peer requesting legacy `Digest-MD5` is rejected by default. If an operator
 explicitly sets `hss.cx.accept_legacy_digest_md5: true`, that request alias is
 accepted but MAA still emits standard SIP Digest with HA1.
 
+Authentication policy is provisioned per private identity. A mobile identity can
+retain `Digest-AKAv1-MD5` while a fixed alias on the same native IMS subscription
+uses `SIP Digest`. An explicit list may allow both for a lab identity. Neither
+request handlers nor username length, number format or User-Agent add a scheme.
+For `Unknown` (also accepting Kamailio's lowercase spelling), the HSS selects
+SIP Digest only when it is explicitly allowed. An AKA-only profile returns 5006
+for that request, as required by TS 29.228 section 6.3.1. A real mobile S-CSCF
+must therefore request `Digest-AKAv1-MD5` explicitly on this strict implementation.
+
+The accompanying IMS S-CSCF patch fixes the original unconditional MD5 fallback.
+It uses the configured AKA default for mobile initial registration and standard
+3GPP-Digest for the dedicated fixed P-CSCF Path. An explicit client AKA algorithm
+is preserved; an IPsec-3GPP Security-Client offer uses the mobile default even on
+that fixed ingress. The fixed Path pattern is an operator configuration entry
+derived from the lab's IMS domain, with no embedded subscriber or site address.
+
 Set `hss.cx.server_capabilities` to the operator's actual `mandatory` and
 `optional` capability lists when capability-based S-CSCF selection is used.
 No capability IDs or S-CSCF endpoints are invented by the new Cx handlers.
+
+## Lab MySQL without TLS and diagnosing USER_UNKNOWN
+
+To explicitly disable TLS for PyHSS's MySQL/MariaDB connection, add this key
+inside the existing `database` section of the actual runtime PyHSS configuration:
+
+```yaml
+database:
+  ssl_disabled: true
+```
+
+Keep your existing database type, server, database name, username and password
+in that same section. Restart all PyHSS processes after changing the setting.
+This forwards `ssl_disabled=True` to PyMySQL. Omitting it leaves the driver's
+default policy in place; `false` does not require encryption. SQLite and
+PostgreSQL are unaffected by this MySQL-specific option. If the server or
+database account requires TLS, it must also permit this lab connection without
+TLS. This flag does not change the server's policy or Diameter/SIP transport.
+
+If your Compose startup generates the configuration, edit the generating
+template too. For the previously supplied merged lab, add the boolean to the
+`database` section in `docker/config.yaml` and recreate the PyHSS containers.
+For a source build, rebuild the PyHSS image to include these updated files.
+
+Run diagnostics inside the PyHSS environment with the same configuration:
+
+```sh
+PYHSS_CONFIG="$HSS_CONFIG_PATH" python tools/diagnose_cx.py \
+  --private-identity "$IMPI" --public-identity "$IMPU" --ifc-report
+```
+
+For an existing container, set `PYHSS_CONTAINER` and `PYHSS_ROOT` to its actual
+name and PyHSS source path, then run:
+
+```sh
+docker exec -w "$PYHSS_ROOT" "$PYHSS_CONTAINER" python tools/diagnose_cx.py \
+  --private-identity "$IMPI" --public-identity "$IMPU" --ifc-report
+```
+
+Supply the exact User-Name and Public-Identity from the failing UAR, including
+their realms and public URI scheme. If the container needs an explicit config
+path, pass `-e PYHSS_CONFIG="$HSS_CONFIG_PATH"` before its container name.
+
+The tool opens a connection with the same native connector settings, queries
+its session `Ssl_cipher` and checks both identities independently, their
+association, native subscriber/AuC links and legacy IFC validity. It creates
+no tables, provisions no identities and changes no registration or SQN. Output
+contains no Ki, OPc, passwords or connection URLs. `mysql_connection_encrypted`
+must be `false` with an empty `mysql_tls_cipher` for plaintext transport.
+The check verifies a new connection using the same settings; restart the live
+workers so existing pooled connections also use the changed policy.
+
+The live HSS also logs explicit lookup reasons such as
+`public_identity_not_provisioned`, `private_identity_not_provisioned` or
+`native_auc_not_found`, without including authentication secrets.
+Experimental 3GPP 5001 is USER_UNKNOWN. Backend exceptions in these patched
+handlers return base 5012. A SQLAlchemy `ROLLBACK` after a read is normal, and
+`cached since` indicates reuse of compiled SQL rather than cached subscriber data.
+
+If the public identity is missing, provision the exact static identity profile
+using `tools/provision_cx_profile.py` before registration. An existing MSISDN row
+alone does not provision every possible full IMPI/IMPU. If the same subscription
+already has an explicit profile, inspect and preserve its other identities when
+replacing it. This is operator provisioning, never learning a binding from UAR.
+Disabling MySQL encryption does not resolve a missing identity.
+
+For a simple fixed SIP Digest profile, the CLI can provision explicit values
+without creating a JSON file. Set `IMPI`, `IMPU`, `VISITED_NETWORK` and
+`IMS_SUBSCRIBER_ID` to the operator-approved values first:
+
+```sh
+docker exec -w "$PYHSS_ROOT" "$PYHSS_CONTAINER" python tools/provision_cx_profile.py \
+  --ims-subscriber-id "$IMS_SUBSCRIBER_ID" \
+  --private-identity "$IMPI" --public-identity "$IMPU" \
+  --authentication-scheme 'SIP Digest' --visited-network "$VISITED_NETWORK" \
+  --set-id fixed --preserve-existing
+```
+
+Repeat `--private-identity`, `--public-identity` or `--visited-network` to provision
+additional explicit entries. Use `--profile` JSON for barred identities or more
+complex implicit sets. The inline options and `--profile` are mutually exclusive.
+This command does not assign an S-CSCF. A fresh initial UAR remains
+FIRST_REGISTRATION because provisioning creates no runtime registration state.
+The fixed client's password must match the native AuC secret used for SIP Digest.
+Keep its authentication username equal to the full provisioned private identity.
+
+`--preserve-existing` reads the pre-provisioned legacy/explicit profile at operator
+provisioning time and retains its identities, sets and authentication policies.
+It does not run during UAR. Use a distinct `--set-id` for a new fixed alias so
+the existing mobile registration set remains intact. Replacing a profile already
+stored in `ims_cx_profile` still requires `--replace` after de-registration.
+
+For a softphone using the *same* IMSI private identity as a SIM, explicitly allow
+SIP Digest in addition to existing AKA. This preserves AKA rather than replacing
+it. Supply that existing full private/public identity and its visited network:
+
+```sh
+docker exec -w "$PYHSS_ROOT" "$PYHSS_CONTAINER" python tools/provision_cx_profile.py \
+  --ims-subscriber-id "$IMS_SUBSCRIBER_ID" \
+  --private-identity "$IMPI" --public-identity "$IMPU" \
+  --authentication-scheme 'SIP Digest' --visited-network "$VISITED_NETWORK" \
+  --preserve-existing --allow-additional-scheme
+```
+
+The existing scheme is retained. Without `--allow-additional-scheme`, adding a
+different scheme to an existing private identity is rejected. Allowing both is
+an explicit lab provisioning policy; it does not silently allow Digest-MD5.
+
+## Reference capture comparison
+
+The supplied successful production capture uses MAR `Unknown`, followed by MAA
+`SIP Digest` with grouped Digest-Realm/Algorithm/QoP/HA1, then subsequent UAR 2002
+and successful SAR. Its LDAP backend stores subscriber data; PyHSS performs those
+lookups through its configured native database. The backend choice does not
+change the Diameter authentication scheme.
+
+The supplied original real-mobile capture uses lowercase `unknown` followed by
+MAA `Digest-AKAv1-MD5`, with RAND/AUTN, XRES, CK and IK. The old HSS accepted that
+scheme fallback. The strict patch retains those AKA vectors and successful SAR
+while correcting the S-CSCF's MAR request to explicit AKA. It does not copy the
+old fallback or its first-UAR prefilled Server-Name behavior as normative rules.
+
+From the original IMS lab root, apply `ims-scscf-mobile-fixed-auth.patch` and
+recreate the S-CSCF so its startup copies the changed configuration:
+
+```sh
+git apply --check /path/to/ims-scscf-mobile-fixed-auth.patch
+git apply /path/to/ims-scscf-mobile-fixed-auth.patch
+docker compose up -d --force-recreate scscf
+```
+
+For the previously delivered merged lab, use
+`ims-scscf-mobile-fixed-auth-merged.patch` instead; its paths begin with `ims/`.
+The patches are checked against their corresponding supplied baselines.
+Kamailio itself is not run locally; validate its startup and capture the new MAR
+on the target lab. Keep MySQL TLS disabling and authentication policy provisioning
+as separate operator settings.
 
 ## Validation and scope
 

@@ -2,39 +2,43 @@
   "baseline_archive": "pyhss-master (1).zip",
   "baseline_sha256": "16c6615989b0930f7146b0a2517f53890dbc8dc3d62b00d30c2369d0140eb17a",
   "standard_reference": "3GPP TS 29.228 / TS 29.229 V18.0.0",
-  "current_package_cx_sqlite": {
-    "tests": 45,
+  "current_sqlite_native_cx_and_diagnostics": {
+    "tests": 76,
     "failures": 0,
     "errors": 0,
     "skipped": 0
   },
-  "current_package_native_config_and_milenage": {
-    "tests": 10,
+  "pytest_summary": "70 passed and 6 subtests passed",
+  "previous_cx_mariadb_validation": {
+    "tests": 41,
     "failures": 0,
     "errors": 0,
     "skipped": 0
   },
-  "earlier_cx_backend_validation": {
-    "note": "Earlier Cx implementation; latest configuration and generated-fixture edits rerun on SQLite.",
-    "mariadb": {
-      "tests": 41,
-      "failures": 0,
-      "errors": 0,
-      "skipped": 0
-    },
-    "postgresql": {
-      "tests": 41,
-      "failures": 0,
-      "errors": 0,
-      "skipped": 0
-    }
+  "previous_cx_postgresql_validation": {
+    "tests": 41,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
   },
-  "native_database_model_declarations_preserved": 28,
-  "subscriber_specific_example_and_trace": "Excluded from upload package.",
-  "test_subscribers_realms_and_credentials": "Generated synthetic values at test runtime.",
-  "new_cx_identity_and_network_sources": "Native database, explicitly provisioned profiles and operator configuration.",
-  "missing_operator_plmn": "Fails with no SQN or assignment writes.",
-  "live_target_sip_validation": "Not performed; target Docker engine/S-CSCF unavailable locally.",
-  "scope": "Reviewed Cx procedures; not whole-stack 3GPP certification.",
-  "patch_application": "Verified against the supplied baseline archive."
+  "latest_live_backend_retry": "Blocked by sandbox network permissions (WinError 10013); not a live backend validation pass.",
+  "tls_setting": "database.ssl_disabled boolean is passed through to the actual PyMySQL driver; default policy is preserved when omitted.",
+  "tls_driver_validation": "SQLAlchemy dialect options were passed to actual PyMySQL deferred connections; ssl=False asserted for explicit disabling.",
+  "diagnostic_tool": "Same native connection settings; no DDL, provisioning, registration or SQN writes; no secret output.",
+  "observed_dump_root_cause": "Empty Cx profiles/identity index; legacy default IFC uses an IMSI private identity and number without plus, while the failed request uses different full identities.",
+  "reproduction": "Generated synthetic empty-profile legacy-template case returns UAA USER_UNKNOWN, then explicit operator provisioning makes first UAA FIRST_REGISTRATION without runtime assignment.",
+  "authentication_policy_validation": "Legacy IMSI AKA UAR/MAR/SAR succeeds without learned Cx identities. Explicit fixed aliases retain mobile policy. Explicitly adding SIP Digest to the same IMSI private identity retains AKA and only permits provisioned schemes.",
+  "production_reference_capture": {
+    "name": "R11_RegOK.pcap",
+    "observed": "UAR 2001, MAR Unknown, MAA SIP Digest with grouped 635/104/111/110/121, UAR 2002, SAR/SAA success."
+  },
+  "original_mobile_reference_capture": {
+    "name": "full_trace.pcapng",
+    "observed": "Real IMS UE; lowercase unknown MAR followed by AKA MAA and successful SAR. Strict correction uses explicit AKA in the S-CSCF instead of the old HSS fallback."
+  },
+  "scscf_patches": "Original IMS and previous merged-lab variants apply cleanly. No local Kamailio runtime or syntax validation was available.",
+  "native_database_models_preserved": 28,
+  "hardcoded_subscriber_identities": "None in the new code or examples; regression fixture identities/realms/secrets are generated.",
+  "live_target_sip_validation": "Not performed.",
+  "scope": "Reviewed Cx procedures; not full-stack 3GPP certification."
 }
