@@ -32,14 +32,22 @@ class Diameter:
     def __init__(
         self,
         logTool,
-        originHost: str = "hss01",
-        originRealm: str = "epc.mnc999.mcc999.3gppnetwork.org",
+        originHost: str = None,
+        originRealm: str = None,
         productName: str = "PyHSS",
-        mcc: str = "999",
-        mnc: str = "999",
+        mcc: str = None,
+        mnc: str = None,
         redisMessaging=None,
         main_service: bool = False,
     ):
+        # Explicit caller values take precedence; otherwise use operator config.
+        hss_config = config.get('hss', {})
+        originHost = originHost if originHost is not None else hss_config.get('OriginHost')
+        originRealm = originRealm if originRealm is not None else hss_config.get('OriginRealm')
+        mcc = mcc if mcc is not None else hss_config.get('MCC')
+        mnc = mnc if mnc is not None else hss_config.get('MNC')
+        if any(value is None or str(value).strip() == '' for value in (originHost, originRealm, mcc, mnc)):
+            raise ValueError('Configure hss.OriginHost, hss.OriginRealm, hss.MCC and hss.MNC')
         self.OriginHost = self.string_to_hex(originHost)
         self.OriginRealm = self.string_to_hex(originRealm)
         self.ProductName = self.string_to_hex(productName)
@@ -60,6 +68,8 @@ class Diameter:
         self.hostname = socket.gethostname()
 
         self.database = Database(logTool=logTool, main_service=main_service)
+        from cx import CxService
+        self.cx = CxService(self, config)
         self.diameterRequestTimeout = int(config.get('hss', {}).get('diameter_request_timeout', 10))
         self.diameterPeerKey = config.get('hss', {}).get('diameter_peer_key', 'diameterPeers')
         self.useDraFallback = config.get('hss', {}).get('use_dra_fallback', False)
@@ -1407,13 +1417,14 @@ class Diameter:
                 return False
 
             if imsi is not None:
-                imsSubscriberDetails = self.database.Get_Subscriber(imsi=imsi)
+                imsSubscriberDetails = self.database.Get_IMS_Subscriber(imsi=imsi)
             if msisdn is not None:
-                imsSubscriberDetails = self.database.Get_Subscriber(msisdn=msisdn)
+                imsSubscriberDetails = self.database.Get_IMS_Subscriber(msisdn=msisdn)
         
             if imsSubscriberDetails is None:
                 return False
             
+            imsi = imsSubscriberDetails['imsi']
             servingScscf = imsSubscriberDetails.get('scscf', None)
             servingScscfPeer = imsSubscriberDetails.get('scscf_peer', None)
             servingScscfRealm = imsSubscriberDetails.get('scscf_realm', None)
@@ -1421,12 +1432,13 @@ class Diameter:
             if servingScscfPeer is not None and servingScscfRealm is not None and servingScscf is not None:
                 if ';' in servingScscfPeer:
                     servingScscfPeer = servingScscfPeer.split(';')[0]
-                servingScscf = servingScscf.replace('sip:', '')
+                from urllib.parse import urlsplit
+                servingScscf = urlsplit(servingScscf.replace('sip:', 'sip://', 1)).hostname
                 if ';' in servingScscf:
                     servingScscf = servingScscf.split(';')[0]
                 self.sendDiameterRequest(
                 requestType='RTR',
-                peerType=servingScscfPeer,
+                hostname=servingScscfPeer,
                 imsi=imsi,
                 destinationHost=servingScscf, 
                 destinationRealm=servingScscfRealm, 
@@ -1436,7 +1448,7 @@ class Diameter:
             if imsi is not None:
                 self.database.Update_Serving_CSCF(imsi=imsi, serving_cscf=None)
             elif msisdn is not None:
-                self.database.Update_Serving_CSCF(msisdn=msisdn, serving_cscf=None)
+                self.database.Update_Serving_CSCF(imsi=imsSubscriberDetails['imsi'], serving_cscf=None)
             
             return True
         except Exception as e:
@@ -1656,22 +1668,9 @@ class Diameter:
             return self.generate_vendor_avp(1001, "c0", 10415, ChargingRuleDef)
 
     def Get_IMS_Subscriber_Details_from_AVP(self, username):
-        #Feed the Username AVP with Tel URI, SIP URI and either MSISDN or IMSI and this returns user data
-        username = binascii.unhexlify(username).decode('utf-8')
-        self.logTool.log(service='HSS', level='debug', message="Username AVP is present, value is " + str(username), redisClient=self.redisMessaging)
-        username = username.split('@')[0]   #Strip Domain to get User part
-        username = username[4:]             #Strip tel: or sip: prefix
-        #Determine if dealing with IMSI or MSISDN
-        if (len(username) == 15) or (len(username) == 16):
-            self.logTool.log(service='HSS', level='debug', message="We have an IMSI: " + str(username), redisClient=self.redisMessaging)
-            ims_subscriber_details = self.database.Get_IMS_Subscriber(imsi=username)
-        else:
-            self.logTool.log(service='HSS', level='debug', message="We have an msisdn: " + str(username), redisClient=self.redisMessaging)
-            if username[0] == '+':
-                username = username[1:]
-            ims_subscriber_details = self.database.Get_IMS_Subscriber(msisdn=username)
-        self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(ims_subscriber_details), redisClient=self.redisMessaging)
-        return ims_subscriber_details
+        """Compatibility entry point; no IMSI/MSISDN length or realm guessing."""
+        identity = bytes.fromhex(username).decode('utf-8')
+        return self.cx.repo.resolve(identity)['record']
 
     def clear_expired_emergency_subscribers(self) -> bool:
         """
@@ -2902,392 +2901,27 @@ class Diameter:
 
     #3GPP Cx User Authorization Answer
     def Answer_16777216_300(self, packet_vars, avps):
-        
-        avp = ''                                                                                         #Initiate empty var AVP                                                                                           #Session-ID
-        session_id = self.get_avp_data(avps, 263)[0]                                                     #Get Session-ID
-        avp += self.generate_avp(263, 40, session_id)                                                    #Set session ID to received session ID
-        avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
-        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (No state maintained)
-        avp += self.generate_avp(260, 40, "0000010a4000000c000028af000001024000000c01000000")            #Vendor-Specific-Application-ID for Cx
-
-
-        OriginRealm = self.get_avp_data(avps, 296)[0]                          #Get OriginRealm from AVP
-        OriginRealm = binascii.unhexlify(OriginRealm).decode('utf-8')      #Format it
-        OriginHost = self.get_avp_data(avps, 264)[0]                          #Get OriginHost from AVP
-        OriginHost = binascii.unhexlify(OriginHost).decode('utf-8')      #Format it
-
-        try:        #Check if we have a record-route set as that's where we'll need to send the response
-            remote_peer = self.get_avp_data(avps, 282)[-1]                          #Get first record-route header
-            remote_peer = binascii.unhexlify(remote_peer).decode('utf-8')           #Format it
-        except:     #If we don't have a record-route set, we'll send the response to the OriginHost
-            remote_peer = OriginHost
-        self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777216_300] [UAR] Remote Peer is " + str(remote_peer), redisClient=self.redisMessaging)
-
-        imsi = ""
-        try:
-            self.logTool.log(service='HSS', level='debug', message="Checking if username present", redisClient=self.redisMessaging)
-            username = self.get_avp_data(avps, 1)[0]                                                     
-            username = binascii.unhexlify(username).decode('utf-8')
-            self.logTool.log(service='HSS', level='debug', message="Username AVP is present, value is " + str(username), redisClient=self.redisMessaging)
-            # Cx UAR: AVP 601 is the public identity. AVP 1 is an IMPI,
-            # NOT an IMSI. Do not strip '+' from E.164 numbers for routing.
-            public_avps = self.get_avp_data(avps, 601)
-            if not public_avps:
-                raise ValueError("Missing Cx Public-Identity (601)")
-            public_identity = binascii.unhexlify(public_avps[0]).decode('utf-8')
-            ims_subscriber_details = self.database.Resolve_IMS_Public_Identity(public_identity)
-            imsi = ims_subscriber_details['imsi']
-            self.logTool.log(service='HSS', level='debug', message="UAR IMPU resolved: " + public_identity + " -> subscriber " + str(imsi), redisClient=self.redisMessaging)
-        except Exception as E:
-            self.logTool.log(service='HSS', level='debug', message="Threw Exception: " + str(E), redisClient=self.redisMessaging)
-            self.logTool.log(service='HSS', level='debug', message=f"No known MSISDN or IMSI in Answer_16777216_300()", redisClient=self.redisMessaging)
-            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
-                                            metricType='counter', metricAction='inc', 
-                                            metricValue=1.0, 
-                                            metricLabels={
-                                                        "diameter_application_id": 16777216,
-                                                        "diameter_cmd_code": 300,
-                                                        "event": "Unknown User",
-                                                        "imsi_prefix": str(imsi[0:6])},
-                                            metricHelp='Diameter Authentication related Counters',
-                                            metricExpiry=60,
-                                            usePrefix=True, 
-                                            prefixHostname=self.hostname, 
-                                            prefixServiceName='metric')
-            result_code = 5001          #IMS User Unknown
-            #Experimental Result AVP
-            avp_experimental_result = ''
-            avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
-            avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
-            avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
-            response = self.generate_diameter_packet("01", "40", 300, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-            return response
-
-        #Determine SAR Type & Store
-        user_authorization_type_avp_data = self.get_avp_data(avps, 623)
-        if user_authorization_type_avp_data:
-            try:
-                User_Authorization_Type = int(user_authorization_type_avp_data[0])
-                self.logTool.log(service='HSS', level='debug', message="User_Authorization_Type is: " + str(User_Authorization_Type), redisClient=self.redisMessaging)
-                if (User_Authorization_Type == 1):
-                    self.logTool.log(service='HSS', level='debug', message="This is Deregister", redisClient=self.redisMessaging)
-                    self.database.Update_Serving_CSCF(imsi, serving_cscf=None)
-                    #Populate S-CSCF Address
-                    avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(ims_subscriber_details['scscf'])),'ascii'))
-                    avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))                                 #Result Code (DIAMETER_SUCCESS (2001))
-                    response = self.generate_diameter_packet("01", "40", 300, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-                    return response
-                    
-            except Exception as E:
-                self.logTool.log(service='HSS', level='debug', message="Failed to get User_Authorization_Type AVP & Update_Serving_CSCF error: " + str(E), redisClient=self.redisMessaging)
-        self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(ims_subscriber_details), redisClient=self.redisMessaging)
-        if ims_subscriber_details['scscf'] != None:
-            self.logTool.log(service='HSS', level='debug', message="Already has SCSCF Assigned from DB: " + str(ims_subscriber_details['scscf']), redisClient=self.redisMessaging)
-            avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(ims_subscriber_details['scscf'])),'ascii'))
-            experimental_avp = ''
-            experimental_avp += experimental_avp + self.generate_avp(266, 40, format(int(10415),"x").zfill(8))          #3GPP Vendor ID            
-            experimental_avp = experimental_avp + self.generate_avp(298, 40, format(int(2002),"x").zfill(8))            #DIAMETER_SUBSEQUENT_REGISTRATION (2002)
-            avp += self.generate_avp(297, 40, experimental_avp)                                                         #Expermental-Result
-        else:
-            self.logTool.log(service='HSS', level='debug', message="No SCSCF Assigned from DB", redisClient=self.redisMessaging)
-            if 'scscf_pool' in config['hss']:
-                try:
-                    scscf = random.choice(config['hss']['scscf_pool'])
-                    self.logTool.log(service='HSS', level='debug', message="Randomly picked SCSCF address " + str(scscf) + " from pool", redisClient=self.redisMessaging)
-                    avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(scscf)),'ascii'))
-                except Exception as E:
-                    avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode("sip:scscf.ims.mnc" + str(self.MNC).zfill(3) + ".mcc" + str(self.MCC).zfill(3) + ".3gppnetwork.org")),'ascii'))
-                    self.logTool.log(service='HSS', level='debug', message="Using generated S-CSCF Address as failed to source from list due to " + str(E), redisClient=self.redisMessaging)
-            else:                        
-                avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode("sip:scscf.ims.mnc" + str(self.MNC).zfill(3) + ".mcc" + str(self.MCC).zfill(3) + ".3gppnetwork.org")),'ascii'))
-                self.logTool.log(service='HSS', level='debug', message="Using generated S-CSCF Address as none set in scscf_pool in config", redisClient=self.redisMessaging)
-            experimental_avp = ''
-            experimental_avp += experimental_avp + self.generate_avp(266, 40, format(int(10415),"x").zfill(8))          #3GPP Vendor ID            
-            experimental_avp = experimental_avp + self.generate_avp(298, 40, format(int(2001),"x").zfill(8))            #DIAMETER_FIRST_REGISTRATION (2001) 
-            avp += self.generate_avp(297, 40, experimental_avp)                                                         #Expermental-Result
-
-        response = self.generate_diameter_packet("01", "40", 300, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-        return response
+        """Cx procedure with exact provisioned identities and explicit state."""
+        packet_vars = dict(packet_vars, command_code=300, ApplicationId=16777216)
+        return self.cx.handle(packet_vars, avps)
 
     #3GPP Cx Server Assignment Answer
     def Answer_16777216_301(self, packet_vars, avps):
-        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
-        session_id = self.get_avp_data(avps, 263)[0]                                                     #Get Session-ID
-        avp += self.generate_avp(263, 40, session_id)                                                    #Set session ID to received session ID
-        avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
-        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (No state maintained)
-
-        avp += self.generate_avp(260, 40, "0000010a4000000c000028af000001024000000c01000000")            #Vendor-Specific-Application-ID for Cx
-
-        OriginHost = self.get_avp_data(avps, 264)[0]                          #Get OriginHost from AVP
-        OriginHost = binascii.unhexlify(OriginHost).decode('utf-8')      #Format it
-
-        OriginRealm = self.get_avp_data(avps, 296)[0]                          #Get OriginRealm from AVP
-        OriginRealm = binascii.unhexlify(OriginRealm).decode('utf-8')      #Format it
-
-        #Find Remote Peer we need to address CLRs through
-        try:        #Check if we have a record-route set as that's where we'll need to send the response
-            remote_peer = self.get_avp_data(avps, 282)[-1]                          #Get first record-route header
-            remote_peer = binascii.unhexlify(remote_peer).decode('utf-8')           #Format it
-        except:     #If we don't have a record-route set, we'll send the response to the OriginHost
-            remote_peer = OriginHost
-        self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777216_301] [SAR] Remote Peer is " + str(remote_peer), redisClient=self.redisMessaging)
-
-        try:
-            self.logTool.log(service='HSS', level='debug', message="Checking if username present", redisClient=self.redisMessaging)
-            username = self.get_avp_data(avps, 601)[0]                                                     
-            ims_subscriber_details = self.Get_IMS_Subscriber_Details_from_AVP(username) 
-            self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(ims_subscriber_details), redisClient=self.redisMessaging)
-            imsi = ims_subscriber_details['imsi']
-            domain = "ims.mnc" + str(self.MNC).zfill(3) + ".mcc" + str(self.MCC).zfill(3) + ".3gppnetwork.org"
-        except Exception as E:
-            self.logTool.log(service='HSS', level='debug', message="Threw Exception: " + str(E), redisClient=self.redisMessaging)
-            self.logTool.log(service='HSS', level='debug', message=f"No known MSISDN or IMSI in Answer_16777216_301()", redisClient=self.redisMessaging)
-            result_code = 5005
-            #Experimental Result AVP
-            avp_experimental_result = ''
-            avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
-            avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
-            avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
-            response = self.generate_diameter_packet("01", "40", 301, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-            return response
-
-        avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(str(imsi) + '@' + str(domain))),'ascii'))
-        #Cx-User-Data (XML)
-        
-        #This loads a Jinja XML template as the default iFC
-        templateLoader = jinja2.FileSystemLoader(searchpath="../")
-        templateEnv = jinja2.Environment(loader=templateLoader)
-        self.logTool.log(service='HSS', level='debug', message="Loading iFC from path " + str(ims_subscriber_details['ifc_path']), redisClient=self.redisMessaging)
-        template = templateEnv.get_template(ims_subscriber_details['ifc_path'])
-        
-        #These variables are passed to the template for use
-        ims_subscriber_details['mnc'] = self.MNC.zfill(3)
-        ims_subscriber_details['mcc'] = self.MCC.zfill(3)
-
-        xmlbody = template.render(iFC_vars=ims_subscriber_details)  # this is where to put args to the template renderer
-        avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))
-        
-        #Charging Information
-        #avp += self.generate_vendor_avp(618, "c0", 10415, "0000026dc000001b000028af7072695f6363665f6164647265737300")
-        #avp += self.generate_avp(268, 40, "000007d1")                                                   #DIAMETER_SUCCESS
-
-        #Determine SAR Type & Store
-        Server_Assignment_Type_Hex = self.get_avp_data(avps, 614)[0]
-        Server_Assignment_Type = self.hex_to_int(Server_Assignment_Type_Hex)
-        self.logTool.log(service='HSS', level='debug', message="Server-Assignment-Type is: " + str(Server_Assignment_Type), redisClient=self.redisMessaging)
-        ServingCSCF = self.get_avp_data(avps, 602)[0]                          #Get OriginHost from AVP
-        ServingCSCF = binascii.unhexlify(ServingCSCF).decode('utf-8')      #Format it
-        self.logTool.log(service='HSS', level='debug', message="Subscriber is served by S-CSCF " + str(ServingCSCF), redisClient=self.redisMessaging)
-        if (Server_Assignment_Type == 1) or (Server_Assignment_Type == 2):
-            self.logTool.log(service='HSS', level='debug', message="SAR is Register / Re-Register", redisClient=self.redisMessaging)
-            remote_peer = remote_peer + ";" + str(config['hss']['OriginHost'])
-            self.database.Update_Serving_CSCF(imsi, serving_cscf=ServingCSCF, scscf_realm=OriginRealm, scscf_peer=remote_peer)
-        else:
-            self.logTool.log(service='HSS', level='debug', message="SAR is not Register", redisClient=self.redisMessaging)
-            #Sometimes we may get a Server Assignment Request for a Deregister for a S-CSCF that no longer serves a subscriber, but that subscriber is now served by another S-CSCF
-            #So we need to check the current S-CSCF from DB == the S-CSCF sending the SAR Deregister before clearing the S-CSCF from the DB
-            username = self.get_avp_data(avps, 601)[0] 
-            ims_subscriber_details = self.Get_IMS_Subscriber_Details_from_AVP(username)   
-            scscf_on_record = ims_subscriber_details.get('scscf', None)
-            if scscf_on_record == ServingCSCF:
-                self.logTool.log(service='HSS', level='debug', message="Subscriber is served by S-CSCF " + str(ServingCSCF) + " and matches S-CSCF on record - Clearing Registration" + str(scscf_on_record), redisClient=self.redisMessaging)
-                self.database.Update_Serving_CSCF(imsi, serving_cscf=None)
-            else:
-                self.logTool.log(service='HSS', level='debug', message="Subscriber is served by S-CSCF " + str(ServingCSCF) + " but does not match S-CSCF on record - Ignoring request to clear registration" + str(scscf_on_record), redisClient=self.redisMessaging)
-
-        avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))                                 #Result Code (DIAMETER_SUCCESS (2001))
-
-        response = self.generate_diameter_packet("01", "40", 301, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-        return response    
+        """Cx procedure with exact provisioned identities and explicit state."""
+        packet_vars = dict(packet_vars, command_code=301, ApplicationId=16777216)
+        return self.cx.handle(packet_vars, avps)
 
     #3GPP Cx Location Information Answer
     def Answer_16777216_302(self, packet_vars, avps):
-        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
-        session_id = self.get_avp_data(avps, 263)[0]                                                     #Get Session-ID
-        avp += self.generate_avp(263, 40, session_id)                                                    #Set session ID to received session ID
-        avp += self.generate_avp(264, 40, self.OriginHost)                                                    #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)
-        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth Session State
-        avp += self.generate_avp(260, 40, "0000010a4000000c000028af000001024000000c01000000")            #Vendor-Specific-Application-ID for Cx
-        
-        try:
-            self.logTool.log(service='HSS', level='debug', message="Checking if username present", redisClient=self.redisMessaging)
-            username = self.get_avp_data(avps, 601)[0] 
-            ims_subscriber_details = self.Get_IMS_Subscriber_Details_from_AVP(username)                                                    
-            if ims_subscriber_details['scscf'] != None:
-                self.logTool.log(service='HSS', level='debug', message="Got SCSCF on record for Sub", redisClient=self.redisMessaging)
-                #Strip double sip prefix
-                avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(str(ims_subscriber_details['scscf']))),'ascii'))
-            else:
-                self.logTool.log(service='HSS', level='debug', message="No SCSF assigned - Using SCSCF Pool", redisClient=self.redisMessaging)
-                if 'scscf_pool' in config['hss']:
-                    try:
-                        scscf = random.choice(config['hss']['scscf_pool'])
-                        self.logTool.log(service='HSS', level='debug', message="Randomly picked SCSCF address " + str(scscf) + " from pool", redisClient=self.redisMessaging)
-                        avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(scscf)),'ascii'))
-                    except Exception as E:
-                        avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode("sip:scscf.ims.mnc" + str(self.MNC).zfill(3) + ".mcc" + str(self.MCC).zfill(3) + ".3gppnetwork.org")),'ascii'))
-                        self.logTool.log(service='HSS', level='debug', message="Using generated iFC as failed to source from list due to " + str(E), redisClient=self.redisMessaging)
-                else:                        
-                    avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode("sip:scscf.ims.mnc" + str(self.MNC).zfill(3) + ".mcc" + str(self.MCC).zfill(3) + ".3gppnetwork.org")),'ascii'))
-                    self.logTool.log(service='HSS', level='debug', message="Using generated iFC", redisClient=self.redisMessaging)
-        except Exception as E:
-            self.logTool.log(service='HSS', level='debug', message="Threw Exception: " + str(E), redisClient=self.redisMessaging)
-            self.logTool.log(service='HSS', level='debug', message=f"No known MSISDN or IMSI in Answer_16777216_302()", redisClient=self.redisMessaging)
-            result_code = 5001
-            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
-                                            metricType='counter', metricAction='inc', 
-                                            metricValue=1.0, 
-                                            metricLabels={
-                                                        "diameter_application_id": 16777216,
-                                                        "diameter_cmd_code": 302,
-                                                        "event": "Unknown User",
-                                                        "imsi_prefix": str(username[0:6])},
-                                            metricHelp='Diameter Authentication related Counters',
-                                            metricExpiry=60,
-                                            usePrefix=True, 
-                                            prefixHostname=self.hostname, 
-                                            prefixServiceName='metric')
-            #Experimental Result AVP
-            avp_experimental_result = ''
-            avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
-            avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
-            avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
-            response = self.generate_diameter_packet("01", "40", 302, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-            return response
-        
-        avp += self.generate_avp(268, 40, "000007d1")                                                   #DIAMETER_SUCCESS
-        response = self.generate_diameter_packet("01", "40", 302, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-        
-        return response
+        """Cx procedure with exact provisioned identities and explicit state."""
+        packet_vars = dict(packet_vars, command_code=302, ApplicationId=16777216)
+        return self.cx.handle(packet_vars, avps)
 
     #3GPP Cx Multimedia Authentication Answer
     def Answer_16777216_303(self, packet_vars, avps):
-        public_identity = self.get_avp_data(avps, 601)[0]
-        public_identity = binascii.unhexlify(public_identity).decode('utf-8')
-        self.logTool.log(service='HSS', level='debug', message="Got MAR for public_identity : " + str(public_identity), redisClient=self.redisMessaging)
-        username = self.get_avp_data(avps, 1)[0]
-        username = binascii.unhexlify(username).decode('utf-8')
-        imsi = username.split('@')[0]   #Strip Domain
-        domain = username.split('@')[1] #Get Domain Part
-        self.logTool.log(service='HSS', level='debug', message="Got MAR username: " + str(username), redisClient=self.redisMessaging)
-        auth_scheme = ''
-
-        avp = ''                                                                                    #Initiate empty var AVP
-        session_id = self.get_avp_data(avps, 263)[0]                                                     #Get Session-ID
-        avp += self.generate_avp(263, 40, session_id)                                                    #Set session ID to received session ID
-        avp += self.generate_avp(260, 40, "0000010a4000000c000028af000001024000000c01000000")            #Vendor-Specific-Application-ID for Cx
-        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth Session State
-        avp += self.generate_avp(264, 40, self.OriginHost)                                                    #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)                                                   #Origin Realm        
-
-        try:
-            subscriber_details = self.database.Get_Subscriber(imsi=imsi)                                               #Get subscriber details
-        except:
-            #Handle if the subscriber is not present in HSS return "DIAMETER_ERROR_USER_UNKNOWN"
-            self.logTool.log(service='HSS', level='debug', message="Subscriber " + str(imsi) + " unknown in HSS for MAA", redisClient=self.redisMessaging)
-            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
-                                            metricType='counter', metricAction='inc', 
-                                            metricValue=1.0, 
-                                            metricLabels={
-                                                        "diameter_application_id": 16777216,
-                                                        "diameter_cmd_code": 303,
-                                                        "event": "Unknown User",
-                                                        "imsi_prefix": str(imsi[0:6])},
-                                            metricHelp='Diameter Authentication related Counters',
-                                            metricExpiry=60,
-                                            usePrefix=True, 
-                                            prefixHostname=self.hostname, 
-                                            prefixServiceName='metric')
-            experimental_result = self.generate_avp(298, 40, self.int_to_hex(5001, 4))                                           #Result Code (DIAMETER ERROR - User Unknown)
-            experimental_result = experimental_result + self.generate_vendor_avp(266, 40, 10415, "")
-            #Experimental Result (297)
-            avp += self.generate_avp(297, 40, experimental_result)
-            response = self.generate_diameter_packet("01", "40", 303, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-            return response
-        
-        self.logTool.log(service='HSS', level='debug', message="Got subscriber data for MAA OK", redisClient=self.redisMessaging)
-        
-        mcc, mnc = imsi[0:3], imsi[3:5]
-        plmn = self.EncodePLMN(mcc, mnc)
-
-        #Determine if SQN Resync is required & auth type to use
-        for sub_avp_612 in self.get_avp_data(avps, 612)[0]:
-            if sub_avp_612['avp_code'] == 610:
-                self.logTool.log(service='HSS', level='debug', message="SQN in HSS is out of sync - Performing resync", redisClient=self.redisMessaging)
-                auts = str(sub_avp_612['misc_data'])[32:]
-                rand = str(sub_avp_612['misc_data'])[:32]
-                rand = binascii.unhexlify(rand)
-                self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "sqn_resync", auts=auts, rand=rand)
-                self.logTool.log(service='HSS', level='debug', message="Resynced SQN in DB", redisClient=self.redisMessaging)
-                self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
-                                                metricType='counter', metricAction='inc', 
-                                                metricValue=1.0, 
-                                                metricLabels={
-                                                            "diameter_application_id": 16777216,
-                                                            "diameter_cmd_code": 302,
-                                                            "event": "ReAuth",
-                                                            "imsi_prefix": str(imsi[0:6])},
-                                                metricHelp='Diameter Authentication related Counters',
-                                                metricExpiry=60,
-                                                usePrefix=True, 
-                                                prefixHostname=self.hostname, 
-                                                prefixServiceName='metric')
-            if sub_avp_612['avp_code'] == 608:
-                self.logTool.log(service='HSS', level='debug', message="Auth mechansim requested: " + str(sub_avp_612['misc_data']), redisClient=self.redisMessaging)
-                auth_scheme = binascii.unhexlify(sub_avp_612['misc_data']).decode('utf-8')
-                self.logTool.log(service='HSS', level='debug', message="Auth mechansim requested: " + str(auth_scheme), redisClient=self.redisMessaging)
-
-        self.logTool.log(service='HSS', level='debug', message="IMSI is " + str(imsi), redisClient=self.redisMessaging)        
-        avp += self.generate_vendor_avp(601, "c0", 10415, str(binascii.hexlify(str.encode(public_identity)),'ascii'))               #Public Identity (IMSI)
-        avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(imsi + "@" + domain)),'ascii'))                                    #Username
-
-    
-
-        #Determine Vectors to Generate
-        if auth_scheme == "Digest-MD5":
-            self.logTool.log(service='HSS', level='debug', message="Generating MD5 Challenge", redisClient=self.redisMessaging)
-            vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "Digest-MD5", username=imsi, plmn=plmn)
-            avp_SIP_Item_Number = self.generate_vendor_avp(613, "c0", 10415, format(int(0),"x").zfill(8))
-            avp_SIP_Authentication_Scheme = self.generate_vendor_avp(608, "c0", 10415, str(binascii.hexlify(b'Digest-MD5'),'ascii'))
-            #Nonce
-            avp_SIP_Authenticate = self.generate_vendor_avp(609, "c0", 10415, str(vector_dict['nonce']))
-            #Expected Response
-            avp_SIP_Authorization = self.generate_vendor_avp(610, "c0", 10415,  str(binascii.hexlify(str.encode(vector_dict['SIP_Authenticate'])),'ascii'))
-            auth_data_item = avp_SIP_Item_Number + avp_SIP_Authentication_Scheme + avp_SIP_Authenticate + avp_SIP_Authorization
-        else:
-            self.logTool.log(service='HSS', level='debug', message="Generating AKA-MD5 Auth Challenge", redisClient=self.redisMessaging)
-            vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "sip_auth", plmn=plmn)
-        
-
-            #diameter.3GPP-SIP-Auth-Data-Items:
-
-            #AVP Code: 613 3GPP-SIP-Item-Number
-            avp_SIP_Item_Number = self.generate_vendor_avp(613, "c0", 10415, format(int(0),"x").zfill(8))
-            #AVP Code: 608 3GPP-SIP-Authentication-Scheme
-            avp_SIP_Authentication_Scheme = self.generate_vendor_avp(608, "c0", 10415, str(binascii.hexlify(b'Digest-AKAv1-MD5'),'ascii'))
-            #AVP Code: 609 3GPP-SIP-Authenticate
-            avp_SIP_Authenticate = self.generate_vendor_avp(609, "c0", 10415, str(binascii.hexlify(vector_dict['SIP_Authenticate']),'ascii'))   #RAND + AUTN
-            #AVP Code: 610 3GPP-SIP-Authorization
-            avp_SIP_Authorization = self.generate_vendor_avp(610, "c0", 10415, str(binascii.hexlify(vector_dict['xres']),'ascii'))  #XRES
-            #AVP Code: 625 Confidentiality-Key
-            avp_Confidentialility_Key = self.generate_vendor_avp(625, "c0", 10415, str(binascii.hexlify(vector_dict['ck']),'ascii'))  #CK
-            #AVP Code: 626 Integrity-Key
-            avp_Integrity_Key = self.generate_vendor_avp(626, "c0", 10415, str(binascii.hexlify(vector_dict['ik']),'ascii'))          #IK
-
-            auth_data_item = avp_SIP_Item_Number + avp_SIP_Authentication_Scheme + avp_SIP_Authenticate + avp_SIP_Authorization + avp_Confidentialility_Key + avp_Integrity_Key
-        avp += self.generate_vendor_avp(612, "c0", 10415, auth_data_item)    #3GPP-SIP-Auth-Data-Item
-            
-        avp += self.generate_vendor_avp(607, "c0", 10415, "00000001")                                    #3GPP-SIP-Number-Auth-Items
-
-
-        avp += self.generate_avp(268, 40, "000007d1")                                                   #DIAMETER_SUCCESS
-        
-        response = self.generate_diameter_packet("01", "40", 303, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-        return response
+        """Cx procedure with exact provisioned identities and explicit state."""
+        packet_vars = dict(packet_vars, command_code=303, ApplicationId=16777216)
+        return self.cx.handle(packet_vars, avps)
 
     #Generate a Generic error handler with Result Code as input
     def Respond_ResultCode(self, packet_vars, avps, result_code):
@@ -4830,33 +4464,8 @@ class Diameter:
 
     #3GPP Cx Registration Termination Request (RTR)
     def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm):
-        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
-        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_cx'                           #Session state generate
-        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))          #Session ID AVP
-        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777216),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (Cx)
-        
-        avp += self.generate_avp(264, 40, self.OriginHost)                                                    #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)                                                   #Origin Realm
-        
-        #SIP-Deregistration-Reason
-        reason_code_avp = self.generate_vendor_avp(616, "c0", 10415, "00000000")
-        reason_info_avp = self.generate_vendor_avp(617, "c0", 10415, self.string_to_hex("Administrative Deregistration"))
-        avp += self.generate_vendor_avp(615, "c0", 10415, reason_code_avp + reason_info_avp)
-        
-        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))                 #Destination Realm
-        avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))                 #Destination Host
-        
-        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (Not maintained)
-        avp += self.generate_avp(1, 40, self.string_to_hex(str(imsi) + "@" + domain))                         #User-Name
-        avp += self.generate_vendor_avp(601, "c0", 10415, self.string_to_hex("sip:" + str(imsi) + "@" + domain))                      #Public-Identity
-        avp += self.generate_vendor_avp(602, "c0", 10415, self.ProductName)                         #Server-Name
-        
-        #* [ Route-Record ]
-        avp += self.generate_avp(282, "40", self.OriginHost)
-    
-        response = self.generate_diameter_packet("01", "c0", 304, 16777216, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
-
-        return response
+        """Cx RTR uses provisioned IMPI rather than reconstructing it from IMSI."""
+        return self.cx.rtr(imsi, destinationHost, destinationRealm)
 
     #3GPP Sh User-Data Request (UDR)
     def Request_16777217_306(self, **kwargs):

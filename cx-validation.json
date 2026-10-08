@@ -1,0 +1,40 @@
+{
+  "baseline_archive": "pyhss-master (1).zip",
+  "baseline_sha256": "16c6615989b0930f7146b0a2517f53890dbc8dc3d62b00d30c2369d0140eb17a",
+  "standard_reference": "3GPP TS 29.228 / TS 29.229 V18.0.0",
+  "current_package_cx_sqlite": {
+    "tests": 45,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "current_package_native_config_and_milenage": {
+    "tests": 10,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "earlier_cx_backend_validation": {
+    "note": "Earlier Cx implementation; latest configuration and generated-fixture edits rerun on SQLite.",
+    "mariadb": {
+      "tests": 41,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "postgresql": {
+      "tests": 41,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  },
+  "native_database_model_declarations_preserved": 28,
+  "subscriber_specific_example_and_trace": "Excluded from upload package.",
+  "test_subscribers_realms_and_credentials": "Generated synthetic values at test runtime.",
+  "new_cx_identity_and_network_sources": "Native database, explicitly provisioned profiles and operator configuration.",
+  "missing_operator_plmn": "Fails with no SQN or assignment writes.",
+  "live_target_sip_validation": "Not performed; target Docker engine/S-CSCF unavailable locally.",
+  "scope": "Reviewed Cx procedures; not whole-stack 3GPP certification.",
+  "patch_application": "Verified against the supplied baseline archive."
+}

@@ -1335,7 +1335,7 @@ class PyHSS_OAM_Deregister(Resource):
             servingMmePeer = subscriberInfo.get('serving_mme_peer', None)
             servingMme = subscriberInfo.get('serving_mme', None)
             servingMmeRealm = subscriberInfo.get('serving_mme_realm', None)
-            servingScscf = subscriberInfo.get('scscf', None)
+            servingScscf = imsSubscriberInfo.get('scscf', None)
             servingScscfPeer = imsSubscriberInfo.get('scscf_peer', None)
             servingScscfRealm = imsSubscriberInfo.get('scscf_realm', None)
             
@@ -1368,27 +1368,18 @@ class PyHSS_OAM_Deregister(Resource):
             if servingScscfPeer is not None and servingScscfRealm is not None and servingScscf is not None:
                 if ';' in servingScscfPeer:
                     servingScscfPeer = servingScscfPeer.split(';')[0]
-                servingScscf = servingScscf.replace('sip:', '')
+                from urllib.parse import urlsplit
+                servingScscf = urlsplit(servingScscf.replace('sip:', 'sip://', 1)).hostname
                 if ';' in servingScscf:
                     servingScscf = servingScscf.split(';')[0]
                 diameterClient.sendDiameterRequest(
                 requestType='RTR',
-                peerType=servingScscfPeer,
+                hostname=servingScscfPeer,
                 imsi=imsi,
                 destinationHost=servingScscf, 
                 destinationRealm=servingScscfRealm, 
                 domain=servingScscfRealm
                 )
-
-            #Broadcast the RTR to all connected SCSCF's, regardless of whether the subscriber is attached.
-            diameterClient.broadcastDiameterRequest(
-            requestType='RTR',
-            peerType='SCSCF',
-            imsi=imsi,
-            destinationHost=servingScscf, 
-            destinationRealm=servingScscfRealm, 
-            domain=servingScscfRealm
-            )
 
             databaseClient.Update_Serving_CSCF(imsi=imsi, serving_cscf=None)
 

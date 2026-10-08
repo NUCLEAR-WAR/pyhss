@@ -486,14 +486,18 @@ class Database:
         else:
             self.redisMessaging = RedisMessaging(host=self.redisHost, port=self.redisPort, useUnixSocket=self.redisUseUnixSocket, unixSocketPath=self.redisUnixSocketPath)
 
-        db_type = str(config['database']['db_type'])
-
-        if db_type == 'postgresql':
-            db_string = 'postgresql+psycopg2://' + str(config['database']['username']) + ':' + str(config['database']['password']) + '@' + str(config['database']['server']) + '/' + str(config['database']['database'])
-        elif db_type == 'mysql':
-            db_string = 'mysql://' + str(config['database']['username']) + ':' + str(config['database']['password']) + '@' + str(config['database']['server']) + '/' + str(config['database']['database'] + "?autocommit=true")
-        elif db_type == 'sqlite':
-            db_string = "sqlite:///" + str(config['database']['database'])
+        from sqlalchemy.engine import URL
+        db_cfg = config['database']
+        db_type = str(db_cfg['db_type']).lower()
+        if db_type == 'sqlite':
+            db_string = URL.create('sqlite', database=str(db_cfg['database']))
+        elif db_type in ('mysql', 'mariadb', 'postgresql'):
+            driver = 'postgresql+psycopg2' if db_type == 'postgresql' else 'mysql+pymysql'
+            server = str(db_cfg['server']); port = db_cfg.get('port')
+            if server.count(':') == 1:
+                server, server_port = server.split(':'); port = port or server_port
+            db_string = URL.create(driver, username=str(db_cfg['username']), password=str(db_cfg['password']),
+                host=server, port=int(port) if port else None, database=str(db_cfg['database']))
         else:
             raise RuntimeError(f'Invalid database.db_type set "{db_type}"')
 
@@ -2143,6 +2147,11 @@ class Database:
                 result.scscf_peer = None
                 scscf_timestamp_string = datetime.datetime.now(tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             
+            # An explicit legacy administrative/GeoRed update supersedes local
+            # Cx runtime state. Never leave a stale assigned server after OAM clear.
+            if sqlalchemy.inspect(self.engine).has_table('ims_cx_state'):
+                session.execute(sqlalchemy.text('DELETE FROM ims_cx_state WHERE ims_subscriber_id=:id'),
+                                {'id': result.ims_subscriber_id})
             session.commit()
             objectData = self.GetObj(IMS_SUBSCRIBER, result.ims_subscriber_id)
             self.handleWebhook(objectData, 'PATCH')
