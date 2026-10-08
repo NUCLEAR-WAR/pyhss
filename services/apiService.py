@@ -2384,6 +2384,48 @@ def _cx_json_safe(value):
     return value
 
 
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/operations/preview/')
+class ProvisionCxOperationsPreview(Resource):
+    @auth_required
+    def get(self, ims_subscriber_id):
+        """Read-only preflight for HSS-initiated RTR/PPR; never changes state."""
+        try:
+            repo = cxProvisioning.repo
+            with repo.engine.connect() as connection:
+                record = repo.record(ims_subscriber_id, connection)
+                definition = repo.definition(record, connection)
+                profile = {'record': record, 'definition': definition}
+                state = repo.state(profile, connection)
+                registered_groups = {
+                    key: {'registered_impis': list(group.get('registered', [])),
+                          'state': group.get('state')}
+                    for key, group in state['groups'].items()
+                    if group.get('registered')
+                }
+                xml = {}
+                for public in definition['public_identities']:
+                    if public['set_id'] not in xml:
+                        profile['public'] = public
+                        xml[public['set_id']] = repo.user_data(profile)
+                assigned = bool(state.get('scscf') and state.get('peer') and state.get('realm'))
+                return _cx_json_safe({
+                    'ims_subscriber_id': ims_subscriber_id,
+                    'scscf': state.get('scscf'),
+                    'peer': state.get('peer'),
+                    'realm': state.get('realm'),
+                    'registered_groups': registered_groups,
+                    'rtr': {'ready': assigned and bool(registered_groups),
+                            'reason': 'ready_for_diameter_transport' if assigned and registered_groups else 'no_active_assignment_or_peer',
+                            'note': 'RTR must wait for correlated RTA before any deletion.'},
+                    'ppr': {'ready': assigned and bool(registered_groups),
+                            'reason': 'ready_for_diameter_transport' if assigned and registered_groups else 'save_for_next_registration',
+                            'saa_xml_by_set': xml,
+                            'note': 'PPR must carry applicable User-Data and wait for correlated PPA.'},
+                    'operation_mode': 'preview_only',
+                }), 200
+        except Exception as error:
+            return handle_exception(error)
+
 @ns_provisioning.route('/cx/<int:ims_subscriber_id>/audit/')
 class ProvisionCxAudit(Resource):
     @auth_required
