@@ -176,19 +176,33 @@ class CxRepository:
         value=definition.get('authentication_schemes',{}).get(profile.get('private'),definition['authentication_scheme'])
         return [value] if isinstance(value,str) else list(value)
 
-    def provision(self,profile_id,definition,replace=False):
+    def provision(self,profile_id,definition,replace=False,clear_authentication_pending=False):
         d=self.validate_definition(definition)
         with self.transaction([profile_id]) as c:
             record=self.record(profile_id,c)
             present=c.execute(select(self.profiles).where(self.profiles.c.ims_subscriber_id==profile_id)).first()
             if present and not replace:raise ValueError('Cx profile exists; use explicit replacement')
             state=c.execute(select(self.states).where(self.states.c.ims_subscriber_id==profile_id)).mappings().first()
-            if state and state['scscf']:raise ValueError('De-register before changing the provisioned Cx profile')
+            clear_pending=False
+            if state and state['scscf']:
+                if not clear_authentication_pending:raise ValueError('De-register before changing the provisioned Cx profile')
+                groups=json.loads(state['groups_json'])
+                if state['registered_at'] or any(group.get('registered') or group.get('state') in ('registered','unregistered') for group in groups.values()):
+                    raise ValueError('Cannot clear authentication pending on a registered or stored unregistered subscription')
+                if not any(group.get('pending') for group in groups.values()):
+                    raise ValueError('Assignment has no unfinished authentication to clear')
+                clear_pending=True
             if not state and record.get('scscf') and record.get('scscf_timestamp'):raise ValueError('De-register the legacy active subscription before changing its Cx profile')
             for kind,identities in [('private',d['private_identities']),('public',[p['identity'] for p in d['public_identities']])]:
                 for identity in identities:
                     other=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==identity,self.identities.c.kind==kind)).first()
                     if other and other[0]!=profile_id:raise ValueError('Identity already provisioned under another subscription')
+            if clear_pending:
+                # This is an explicit OAM operation in the profile transaction.
+                # SQN and native AuC/subscriber data are never reset here.
+                c.execute(delete(self.states).where(self.states.c.ims_subscriber_id==profile_id))
+                c.execute(update(self.ims).where(self.ims.c.ims_subscriber_id==profile_id).values(
+                    scscf=None,scscf_realm=None,scscf_peer=None,scscf_timestamp=None))
             c.execute(delete(self.identities).where(self.identities.c.ims_subscriber_id==profile_id))
             if present:c.execute(update(self.profiles).where(self.profiles.c.ims_subscriber_id==profile_id).values(definition=json.dumps(d)))
             else:c.execute(self.profiles.insert().values(ims_subscriber_id=profile_id,definition=json.dumps(d)))

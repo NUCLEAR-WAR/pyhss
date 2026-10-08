@@ -13,7 +13,7 @@ from pyhss_config import config
 from cx_repository import CxRepository
 from copy import deepcopy
 
-def preserve_definition(existing,additional,allow_additional_scheme=False):
+def preserve_definition(existing,additional,allow_additional_scheme=False,associate_existing_public=False):
     """Explicit operator merge; never infer authentication policy from a request."""
     base=CxRepository.validate_definition(existing)
     extra=CxRepository.validate_definition(additional)
@@ -34,11 +34,24 @@ def preserve_definition(existing,additional,allow_additional_scheme=False):
     base['authentication_schemes']=schemes
     base['private_identities']=list(dict.fromkeys(base['private_identities']+extra['private_identities']))
     by_identity={item['identity']:item for item in base['public_identities']}
+    extended_sets={}
     for item in extra['public_identities']:
         if item['identity'] in by_identity:
-            if item!=by_identity[item['identity']]:raise ValueError('Use an explicit JSON profile to change an existing public identity association')
+            present=by_identity[item['identity']]
+            if associate_existing_public:
+                # This operation only adds associations. It never reassigns a URI
+                # to another set, changes barring, or removes an existing IMPI.
+                policy={key:value for key,value in item.items() if key!='private_identities'}
+                existing_policy={key:value for key,value in present.items() if key!='private_identities'}
+                if policy!=existing_policy:raise ValueError('Association extension cannot change the public identity policy or registration set')
+                extended_sets.setdefault(present['set_id'],set()).update(item['private_identities'])
+            elif item!=present:raise ValueError('Use --associate-existing-public to explicitly extend an existing public identity association')
             continue
         base['public_identities'].append(item)
+    for item in base['public_identities']:
+        if item['set_id'] in extended_sets:
+            item['private_identities']=list(dict.fromkeys(item['private_identities']+
+                [private for private in base['private_identities'] if private in extended_sets[item['set_id']]]))
     base['visited_networks']=list(dict.fromkeys((base.get('visited_networks') or [base['digest_realm']])+extra.get('visited_networks',[])))
     return CxRepository.validate_definition(base)
 
@@ -56,10 +69,16 @@ def main():
     p.add_argument('--unregistered-service',action='store_true')
     p.add_argument('--preserve-existing',action='store_true',help='Retain existing/legacy identities and their authentication policies while adding explicit aliases')
     p.add_argument('--allow-additional-scheme',action='store_true',help='Explicitly allow another scheme for an existing private identity while preserving its current scheme')
+    p.add_argument('--associate-existing-public',action='store_true',help='Explicitly add the supplied private identities to existing public identities and their entire implicit registration set')
+    p.add_argument('--clear-authentication-pending',action='store_true',help='Cancel only unfinished authentication before profile replacement; refuses registered or stored unregistered service state')
     p.add_argument('--replace',action='store_true',help='Replace an existing explicitly provisioned profile after de-registration')
     args=p.parse_args()
     if args.allow_additional_scheme and not args.preserve_existing:
         p.error('--allow-additional-scheme requires --preserve-existing')
+    if args.associate_existing_public and not args.preserve_existing:
+        p.error('--associate-existing-public requires --preserve-existing')
+    if args.clear_authentication_pending and not args.replace:
+        p.error('--clear-authentication-pending requires --replace')
     inline=any((args.private_identity,args.public_identity,args.authentication_scheme,args.digest_realm,
                 args.visited_network,args.unregistered_service,args.set_id!='default'))
     if args.profile and inline:p.error('Choose either --profile or explicit identity/policy arguments')
@@ -83,8 +102,8 @@ def main():
             ident=rows[0][0]
         if args.preserve_existing:
             record=repo.record(ident,c)
-            definition=preserve_definition(repo.definition(record,c),definition,args.allow_additional_scheme)
-    repo.provision(ident,definition,args.replace)
+            definition=preserve_definition(repo.definition(record,c),definition,args.allow_additional_scheme,args.associate_existing_public)
+    repo.provision(ident,definition,args.replace,clear_authentication_pending=args.clear_authentication_pending)
     print(f'Provisioned Cx identities for IMS subscriber #{ident}; no registration or S-CSCF was assigned')
 
 if __name__=='__main__':main()
