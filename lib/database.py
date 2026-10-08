@@ -186,6 +186,14 @@ class IMS_SUBSCRIBER(Base):
     last_modified = Column(String(100), default=datetime.datetime.now(tz=timezone.utc), doc='Timestamp of last modification')
     operation_logs = relationship("IMS_SUBSCRIBER_OPERATION_LOG", back_populates="ims_subscriber")
 
+class IMS_IDENTITY_BINDING(Base):
+    """Provisioned exact Cx identity association; never infer IMSI from URI."""
+    __tablename__ = 'ims_identity_binding'
+    binding_id = Column(Integer, primary_key=True)
+    ims_subscriber_id = Column(Integer, nullable=False, index=True)
+    impi = Column(String(512), nullable=False, index=True)
+    impu = Column(String(512), nullable=False, unique=True, index=True)
+
 class ROAMING_NETWORK(Base):
     __tablename__ = 'roaming_network'
     roaming_network_id = Column(Integer, primary_key = True, doc='Unique ID of ROAMING_NETWORK entry')
@@ -1314,6 +1322,25 @@ class Database:
         self.logTool.log(service='Database', level='debug', message="Got back result: " + str(result), redisClient=self.redisMessaging)
         self.safe_close(session)
         return result
+
+    def Get_IMS_Subscriber_By_Identity(self, impu, impi=None):
+        """Resolve a public identity and optionally enforce private/public binding."""
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        try:
+            query = session.query(IMS_IDENTITY_BINDING).filter_by(impu=str(impu))
+            if impi is not None:
+                query = query.filter_by(impi=str(impi))
+            binding = query.one()
+            subscriber = session.query(IMS_SUBSCRIBER).filter_by(
+                ims_subscriber_id=binding.ims_subscriber_id).one()
+            result = dict(subscriber.__dict__)
+            result.pop('_sa_instance_state', None)
+            result['cx_impi'] = binding.impi
+            result['cx_impu'] = binding.impu
+            return self.Sanitize_Datetime(result)
+        finally:
+            self.safe_close(session)
 
     def Get_IMS_Subscriber(self, **kwargs):
         #Get subscriber by IMSI or MSISDN
