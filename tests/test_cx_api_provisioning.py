@@ -26,7 +26,7 @@ def test_native_service_and_cx_are_provisioned_atomically_and_digest_bootstrap_i
     d,_=lab;svc=CxProvisioning(d.database,config);payload=bundle(d)
     result_data=svc.create_service(payload)
     ims=result_data['ims_subscriber'];profile=ims['cx']
-    private=payload['subscriber']['imsi']+'@'+REALM;lookup='+'+payload['subscriber']['msisdn']+'@'+REALM;public='sip:'+lookup+';user=phone'
+    private=payload['subscriber']['imsi']+'@'+REALM;lookup='+'+payload['subscriber']['msisdn']+'@'+REALM;public='sip:'+lookup
     assert profile['provisioning']['private_identity']==private
     assert profile['digest_identity_aliases'][lookup]==private
     assert 'ki' not in result_data['auc']
@@ -45,7 +45,7 @@ def test_tel_public_identities_are_global_in_actual_saa_after_provisioning_and_l
     import xml.etree.ElementTree as ET
     d,_=lab;svc=CxProvisioning(d.database,config);payload=bundle(d)
     ims=svc.create_service(payload)['ims_subscriber'];ident=ims['ims_subscriber_id']
-    private=ims['cx']['provisioning']['private_identity'];public='sip:+'+payload['subscriber']['msisdn']+'@'+REALM+';user=phone'
+    private=ims['cx']['provisioning']['private_identity'];public='sip:+'+payload['subscriber']['msisdn']+'@'+REALM
     # Reproduce the prior generated compatibility TEL entry in a stored profile.
     legacy=deepcopy(ims['cx']);bare='tel:'+payload['subscriber']['msisdn']
     legacy['public_identities'].append({'identity':bare,'set_id':'fixed','barred':False,'private_identities':legacy['private_identities']})
@@ -82,7 +82,7 @@ def associated_publics(d,avps):
 def test_only_global_number_publics_are_advertised_by_default_without_breaking_authentication(lab,mode):
     d,_=lab;svc=CxProvisioning(d.database,config);payload=bundle(d,mode)
     ims=svc.create_service(payload)['ims_subscriber'];private=ims['cx']['provisioning']['private_identity']
-    number='+'+payload['subscriber']['msisdn'];public='sip:'+number+'@'+REALM+';user=phone'
+    number='+'+payload['subscriber']['msisdn'];public='sip:'+number+'@'+REALM
     scheme='SIP Digest' if mode=='sip_digest' else 'Digest-AKAv1-MD5'
     lookup=number+'@'+REALM if mode=='sip_digest' else private
     avps,_=mar(d,lookup,public,scheme);assert result(d,avps)==('base',2001)
@@ -97,7 +97,7 @@ def test_explicit_non_e164_service_publics_survive_native_updates_and_are_delive
     ims=svc.create_service(payload)['ims_subscriber'];ident=ims['ims_subscriber_id']
     replacement=digits(11);ims=svc.save({'msisdn':replacement},ident)
     assert all(identity in [item['identity'] for item in ims['cx']['public_identities']] for identity in services)
-    private=ims['cx']['provisioning']['private_identity'];public='sip:+'+replacement+'@'+REALM+';user=phone'
+    private=ims['cx']['provisioning']['private_identity'];public='sip:+'+replacement+'@'+REALM
     mar(d,private,public);avps,_=sar(d,1,private,public)
     assert result(d,avps)==('base',2001)
     assert sorted(associated_publics(d,avps))==sorted([public,'tel:+'+replacement]+services)
@@ -127,7 +127,7 @@ def test_generated_no_plus_sip_alias_is_cleaned_but_manually_added_alias_is_pres
 
 def test_api_update_regenerates_managed_numbers_without_keeping_stale_index(lab):
     d,_=lab;svc=CxProvisioning(d.database,config);payload=bundle(d);saved=svc.create_service(payload)['ims_subscriber']
-    previous='sip:+'+payload['subscriber']['msisdn']+'@'+REALM+';user=phone'
+    previous='sip:+'+payload['subscriber']['msisdn']+'@'+REALM
     replacement=digits(11)
     updated=svc.save({'msisdn':replacement},saved['ims_subscriber_id'])
     assert previous not in [item['identity'] for item in updated['cx']['public_identities']]
@@ -139,7 +139,7 @@ def test_api_update_regenerates_managed_numbers_without_keeping_stale_index(lab)
 
 def test_registered_identity_update_rolls_back_native_msisdn_change(lab):
     d,_=lab;svc=CxProvisioning(d.database,config);payload=bundle(d);saved=svc.create_service(payload)['ims_subscriber']
-    private=payload['subscriber']['imsi']+'@'+REALM;public='sip:+'+payload['subscriber']['msisdn']+'@'+REALM+';user=phone'
+    private=payload['subscriber']['imsi']+'@'+REALM;public='sip:+'+payload['subscriber']['msisdn']+'@'+REALM
     mar(d,private,public);sar(d,1,private,public)
     with pytest.raises(ProvisioningConflict):svc.save({'msisdn':digits(11)},saved['ims_subscriber_id'])
     assert svc.get(saved['ims_subscriber_id'])['msisdn']==saved['msisdn']
@@ -154,7 +154,7 @@ def test_atomic_update_keeps_native_and_cx_numbers_coherent_and_rolls_back_when_
     sid=saved['subscriber']['subscriber_id'];iid=saved['ims_subscriber']['ims_subscriber_id'];replacement=digits(11)
     updated=svc.update_service(sid,{'subscriber':{'msisdn':replacement},'ims_subscriber':{'msisdn':replacement}})
     assert updated['subscriber']['msisdn']==updated['ims_subscriber']['msisdn']==replacement
-    private=updated['ims_subscriber']['cx']['provisioning']['private_identity'];public='sip:+'+replacement+'@'+REALM+';user=phone'
+    private=updated['ims_subscriber']['cx']['provisioning']['private_identity'];public='sip:+'+replacement+'@'+REALM
     mar(d,private,public);sar(d,1,private,public)
     with pytest.raises(ProvisioningConflict):svc.update_service(sid,{'subscriber':{'msisdn':digits(11)},'ims_subscriber':{'msisdn':digits(11)},'auc':{'ki':'changed'}})
     with d.database.engine.connect() as c:assert c.scalar(select(SUBSCRIBER.msisdn).where(SUBSCRIBER.subscriber_id==sid))==replacement
@@ -182,7 +182,7 @@ def test_standard_ims_crud_routes_automatically_create_update_and_remove_cx(api_
     replacement=digits(11)
     response=client.patch('/ims_subscriber/'+str(ident),json={'msisdn':replacement})
     assert response.status_code==200,response.get_json()
-    assert 'sip:+'+replacement+'@'+REALM+';user=phone' in [x['identity'] for x in response.get_json()['cx']['public_identities']]
+    assert 'sip:+'+replacement+'@'+REALM in [x['identity'] for x in response.get_json()['cx']['public_identities']]
     response=client.delete('/ims_subscriber/'+str(ident));assert response.status_code==200,response.get_json()
     with module.databaseClient.engine.connect() as c:assert not c.scalar(select(module.cxProvisioning.repo.profiles.c.ims_subscriber_id).where(module.cxProvisioning.repo.profiles.c.ims_subscriber_id==ident))
 

@@ -227,14 +227,19 @@ class CxService:
                 _,definition=self.repo.find(private,'private',c)
             publics=[p['identity'] for p in definition['public_identities'] if private_key(private) in p['private_identities']]
         profiles=[self.repo.resolve(p,private) for p in publics]
+        if private and any(private_key(private) in p['definition'].get('digest_identity_aliases',{}) for p in profiles):
+            # Bootstrap lookup names are not authenticating private identities.
+            # MAR has already returned the real IMPI for the S-CSCF to use.
+            raise CxError(5002)
         # Optional restoration/wildcard features are not negotiated or silently applied.
         if self.values(avps,634,VENDOR) or self.values(avps,639,VENDOR) or self.integer(avps,655,default=0):raise CxError(5011)
         payload='';code=2001;experimental=False
         if typ in (0,1,2,3) and not available:
             profile=profiles[0];chosen=private or profile['public']['private_identities'][0]
             payload=self.avp(1,chosen)+self.avp(606,self.repo.user_data(profile,chosen),VENDOR)
-            if len(profile['definition']['private_identities'])>1:
-                payload+=self.grouped(632,''.join(self.avp(1,x) for x in profile['definition']['private_identities']))
+            authentication_identities=[identity for identity in profile['definition']['private_identities'] if identity not in profile['definition'].get('digest_identity_aliases',{})]
+            if len(authentication_identities)>1:
+                payload+=self.grouped(632,''.join(self.avp(1,x) for x in authentication_identities))
         with self.repo.transaction([p['record']['ims_subscriber_id'] for p in profiles]) as c:
             states={};seen=set()
             for profile in profiles:
@@ -310,11 +315,12 @@ class CxService:
                 for identity in group.get('known_private',group['registered']):
                     if identity not in known:known.append(identity)
             target=known[0] if known else definition['private_identities'][0]
+            target=definition.get('digest_identity_aliases',{}).get(target,target)
         sid=bytes.fromhex(self.d.OriginHost).decode()+';cx-rtr;'+__import__('uuid').uuid4().hex
         payload=self.avp(263,sid)+self.d.generate_avp(264,'40',self.d.OriginHost)+self.d.generate_avp(296,'40',self.d.OriginRealm)
         payload+=self.grouped(260,self.avp(266,VENDOR,integer=True)+self.avp(258,CX_APP,integer=True),vendor=0)
         payload+=self.avp(277,1,integer=True)+self.avp(293,destination_host)+self.avp(283,destination_realm)+self.avp(1,target)
         payload+=self.grouped(615,self.avp(616,0,VENDOR,True)+self.avp(617,'Administrative de-registration',VENDOR))
-        associated=[x for x in definition['private_identities'] if x!=target]
+        associated=[x for x in definition['private_identities'] if x!=target and x not in definition.get('digest_identity_aliases',{})]
         if associated:payload+=self.grouped(632,''.join(self.avp(1,x) for x in associated))
         return self.d.generate_diameter_packet('01','c0',304,CX_APP,self.d.generate_id(4),self.d.generate_id(4),payload)

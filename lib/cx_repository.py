@@ -56,8 +56,8 @@ def validate_provisioned_public_uri(identity,private_derived=False):
         phone_context=any(p.partition('=')[0].lower()=='phone-context' for p in user_parameters)
         if users==['phone']:
             validate_provisioned_public_uri('tel:'+user)
-        elif number.startswith('+') or phone_context or (number.isascii() and number.isdigit() and not private_derived and not users):
-            raise ValueError('SIP telephone public identity requires user=phone: '+identity)
+        # Unmarked SIP userinfo is an explicitly provisioned SIP username.
+        # Do not force phone interpretation or append parameters in DB keys.
         return identity
     if not identity.startswith('tel:'):return identity
     number,*parameters=identity[4:].split(';')
@@ -230,6 +230,7 @@ class CxRepository:
     @staticmethod
     def authentication_schemes(profile):
         definition=profile['definition']
+        if profile.get('private') in definition.get('digest_identity_aliases',{}):return ['SIP Digest']
         value=definition.get('authentication_schemes',{}).get(profile.get('private'),definition['authentication_scheme'])
         return [value] if isinstance(value,str) else list(value)
 
@@ -264,9 +265,10 @@ class CxRepository:
                 clear_pending=True
             if not state and record.get('scscf') and record.get('scscf_timestamp'):raise ValueError('De-register the legacy active subscription before changing its Cx profile')
             for kind,identities in [('private',d['private_identities']),('public',[p['identity'] for p in d['public_identities']])]:
-                for identity in identities:
-                    other=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==identity,self.identities.c.kind==kind)).first()
-                    if other and other[0]!=profile_id:raise ValueError('Identity already provisioned under another subscription')
+                other=c.execute(select(self.identities.c.ims_subscriber_id).where(
+                    self.identities.c.identity.in_(identities),self.identities.c.kind==kind,
+                    self.identities.c.ims_subscriber_id!=profile_id)).first()
+                if other:raise ValueError('Identity already provisioned under another subscription')
             if clear_pending:
                 # This is an explicit OAM operation in the profile transaction.
                 # SQN and native AuC/subscriber data are never reset here.
@@ -276,22 +278,27 @@ class CxRepository:
             c.execute(delete(self.identities).where(self.identities.c.ims_subscriber_id==profile_id))
             if present:c.execute(update(self.profiles).where(self.profiles.c.ims_subscriber_id==profile_id).values(definition=json.dumps(d)))
             else:c.execute(self.profiles.insert().values(ims_subscriber_id=profile_id,definition=json.dumps(d)))
-            for kind,values in [('private',d['private_identities']),('public',[p['identity'] for p in d['public_identities']])]:
+            for kind,values in [('private',[identity for identity in d['private_identities'] if identity not in d.get('digest_identity_aliases',{})]),('public',[p['identity'] for p in d['public_identities']])]:
                 c.execute(self.identities.insert(),[{'identity':i,'kind':kind,'ims_subscriber_id':profile_id} for i in values])
         return d
 
     def find(self,identity,kind,c):
         try:key=private_key(identity) if kind=='private' else public_key(identity)
         except ValueError:raise CxError(5001,reason='invalid_'+kind+'_identity_format')
-        explicit=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==key,self.identities.c.kind==kind)).first()
+        explicit=c.execute(select(self.ims,self.profiles.c.definition).select_from(
+            self.identities.join(self.ims,self.identities.c.ims_subscriber_id==self.ims.c.ims_subscriber_id)
+            .join(self.profiles,self.profiles.c.ims_subscriber_id==self.ims.c.ims_subscriber_id))
+            .where(self.identities.c.identity==key,self.identities.c.kind==kind)).mappings().first()
         if explicit:
-            record=self.record(explicit[0],c);return record,self.definition(record,c)
+            record=dict(explicit);definition=record.pop('definition')
+            return record,self.validate_definition(json.loads(definition))
         matches=[]
         # Legacy transition: use provisioned XML, not numeric length or a request's realm.
-        records=c.execute(select(self.ims)).mappings().all()
+        records=c.execute(select(self.ims).select_from(self.ims.outerjoin(
+            self.profiles,self.profiles.c.ims_subscriber_id==self.ims.c.ims_subscriber_id))
+            .where(self.profiles.c.ims_subscriber_id.is_(None))).mappings().all()
         for row in records:
             record=dict(row)
-            if c.execute(select(self.profiles.c.ims_subscriber_id).where(self.profiles.c.ims_subscriber_id==record['ims_subscriber_id'])).first():continue
             try:d=self.validate_definition(self.legacy_profile(record))
             except (ValueError,ET.ParseError,jinja2.TemplateError):continue
             values=d['private_identities'] if kind=='private' else [p['identity'] for p in d['public_identities']]
@@ -306,8 +313,13 @@ class CxRepository:
         record,d=self.find(public,'public',c)
         item=next(x for x in d['public_identities'] if x['identity']==public_key(public))
         if private is not None:
-            private_record,_=self.find(private,'private',c)
-            if private_record['ims_subscriber_id']!=record['ims_subscriber_id'] or private_key(private) not in item['private_identities']:raise CxError(5002)
+            requested=private_key(private);target=d.get('digest_identity_aliases',{}).get(requested,requested)
+            if target!=requested:
+                other=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==requested,self.identities.c.kind=='private')).first()
+                if other and other[0]!=record['ims_subscriber_id']:raise CxError(5002)
+                if requested not in item['private_identities']:raise CxError(5002)
+            private_record,_=self.find(target,'private',c)
+            if private_record['ims_subscriber_id']!=record['ims_subscriber_id'] or target not in item['private_identities']:raise CxError(5002)
         return {'record':record,'definition':d,'public':item,'private':private_key(private) if private else None}
 
     def state(self,profile,c):

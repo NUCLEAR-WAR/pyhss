@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--This is the default iFC template used by PyHSS, variables come from the Jinja2 template passed inside diameter.py where you can additional variables if required -->
 <IMSSubscription>
-    <PrivateID>{{ iFC_vars['imsi'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</PrivateID>
+    <PrivateID>{{ iFC_vars['imsi'] }}@ims.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</PrivateID>
     <ServiceProfile>
         <PublicIdentity>
-            <Identity>sip:+{{ iFC_vars['msisdn'] | string | replace('+', '') }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org;user=phone</Identity>
+            <Identity>sip:+{{ iFC_vars['msisdn'] | string | replace('+', '') }}@ims.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org;user=phone</Identity>
             <Extension>
                 <IdentityType>0</IdentityType>
                 <Extension>
@@ -23,7 +23,7 @@
         </PublicIdentity>
         <PublicIdentity>
             <BarringIndication>1</BarringIndication>
-            <Identity>sip:{{ iFC_vars['imsi'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</Identity>
+            <Identity>sip:{{ iFC_vars['imsi'] }}@ims.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</Identity>
             <Extension>
                 <IdentityType>0</IdentityType>
             </Extension>
@@ -43,7 +43,7 @@
                 </SPT>
             </TriggerPoint>
             <ApplicationServer>
-                <ServerName>sip:applicationserver.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org:5060</ServerName>
+                <ServerName>sip:applicationserver.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
                 <DefaultHandling>0</DefaultHandling>
                 <Extension>
                     <IncludeRegisterRequest/>
@@ -64,7 +64,7 @@
                 </SPT>
             </TriggerPoint>
             <ApplicationServer>
-                <ServerName>sip:smsc.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org:5060</ServerName>
+                <ServerName>sip:smsc.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
                 <DefaultHandling>0</DefaultHandling>
                 <Extension>
                     <IncludeRegisterRequest/>
@@ -100,7 +100,7 @@
                 </SPT>
             </TriggerPoint>
             <ApplicationServer>
-                <ServerName>sip:smsc.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org:5060</ServerName>
+                <ServerName>sip:smsc.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
                 <DefaultHandling>0</DefaultHandling>
             </ApplicationServer>
         </InitialFilterCriteria>
@@ -120,7 +120,7 @@
                 </SPT>                
             </TriggerPoint>
             <ApplicationServer>
-                <ServerName>sip:ussd.ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org:5060</ServerName>
+                <ServerName>sip:ussd.ims.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
                 <DefaultHandling>0</DefaultHandling>
             </ApplicationServer>
         </InitialFilterCriteria>
@@ -142,7 +142,7 @@
                 </SPT>             
             </TriggerPoint>
             <ApplicationServer>
-                <ServerName>sip:applicationserver.ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
+                <ServerName>sip:applicationserver.ims.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
                 <DefaultHandling>0</DefaultHandling>
             </ApplicationServer>
         </InitialFilterCriteria>
@@ -165,7 +165,7 @@
                 </SPT>           
             </TriggerPoint>
             <ApplicationServer>
-                <ServerName>sip:voicemail.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org:5060</ServerName>
+                <ServerName>sip:voicemail.mnc{{ (iFC_vars['mnc'] | string).zfill(3) }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
                 <DefaultHandling>0</DefaultHandling>
             </ApplicationServer>
         </InitialFilterCriteria> -->
