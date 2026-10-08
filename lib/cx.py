@@ -66,6 +66,17 @@ class CxService:
         caps=self.settings.get('server_capabilities',{})
         children=''.join(self.avp(604,int(x),VENDOR,True) for x in caps.get('mandatory',[]))
         children+=''.join(self.avp(605,int(x),VENDOR,True) for x in caps.get('optional',[]))
+        from service_discovery import hostname
+        candidates=caps.get('server_names',self.repo.config.get('hss',{}).get('scscf_pool',[])) or []
+        if not isinstance(candidates,list):raise ValueError('S-CSCF candidates must be a list')
+        names=[]
+        for candidate in candidates:
+            if not isinstance(candidate,str):raise ValueError('S-CSCF candidate must be a DNS name')
+            scheme='sips' if candidate.startswith('sips:') else 'sip'
+            domain=candidate[len(scheme)+1:] if candidate.startswith(scheme+':') else candidate
+            names.append(scheme+':'+hostname(domain))
+        # These are candidates nested inside Server-Capabilities, not assignments.
+        children+=''.join(self.server(name) for name in dict.fromkeys(names))
         return self.grouped(603,children) if children else ''
 
     def answer(self,packet,avps,code,payload='',experimental=False,failed=None):
@@ -235,7 +246,7 @@ class CxService:
         if self.values(avps,634,VENDOR) or self.values(avps,639,VENDOR) or self.integer(avps,655,default=0):raise CxError(5011)
         payload='';code=2001;experimental=False
         if typ in (0,1,2,3) and not available:
-            profile=profiles[0];chosen=private or profile['public']['private_identities'][0]
+            profile=profiles[0];chosen=private or self.repo.default_authentication_identity(profile)
             payload=self.avp(1,chosen)+self.avp(606,self.repo.user_data(profile,chosen),VENDOR)
             real_private=[identity for identity in profile['definition']['private_identities'] if identity not in profile['definition'].get('digest_identity_aliases',{})]
             if len(real_private)>1:
@@ -259,7 +270,7 @@ class CxService:
                     if private not in known:known.append(private)
                     state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
                 elif typ==3:
-                    chosen=private or profile['public']['private_identities'][0]
+                    chosen=private or self.repo.default_authentication_identity(profile)
                     group={'state':'unregistered','registered':[],'pending':[],'known_private':[chosen]}
                     state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
                 elif typ in (9,10):
@@ -290,17 +301,18 @@ class CxService:
         return code,payload,experimental
 
     def lir(self,avps):
-        public=self.text(avps,601,VENDOR);originating_type=self.integer(avps,633,default=1)
-        if originating_type not in (0,1):raise CxError(5004,False,(633,VENDOR,self.one(avps,633,VENDOR)['misc_data']))
-        originating=originating_type==0
+        public=self.text(avps,601,VENDOR);originating_avp=self.one(avps,633,VENDOR,False)
+        originating=originating_avp is not None
+        if originating and self.integer(avps,633)!=0:
+            raise CxError(5004,False,(633,VENDOR,originating_avp['misc_data']))
         profile=self.repo.resolve(public)
         with self.repo.engine.connect() as c:state=self.repo.state(profile,c)
         group=self.repo.group(state,profile['public']['set_id'])
         if group['state'] in ('registered','unregistered') and state['scscf']:return 2001,self.server(state['scscf']),False
-        if originating or profile['definition']['unregistered_service']:
+        if originating or self.repo.terminating_unregistered_service(profile):
             if state['scscf']:return 2001,self.server(state['scscf']),False
             return 2003,self.capabilities(),True
-        raise CxError(5003)
+        raise CxError(5003,reason='terminating_unregistered_service_not_available')
 
     def rtr(self,imsi,destination_host,destination_realm):
         """Terminate a provisioned IMS subscription using its actual private IDs."""

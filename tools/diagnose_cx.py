@@ -73,6 +73,12 @@ def diagnose(engine,private=None,public=None,ifc_report=False):
                 except CxError as error:
                     report['identity_association']='mismatch' if error.code==5002 else 'lookup_rejected'
             else:report['identity_association']='cannot_validate_missing_identity'
+        if 'public' in found:
+            profile=repo.resolve(public,c=c);state=repo.state(profile,c)
+            report['unregistered_service_policy']=repo.unregistered_service_policy(profile['definition'])
+            report['unregistered_service_effective']=repo.terminating_unregistered_service(profile)
+            report['assigned_scscf']=state['scscf']
+            report['public_registration_state']=repo.group(state,profile['public']['set_id'])['state']
         if ifc_report:
             explicit=set(c.execute(select(repo.profiles.c.ims_subscriber_id)).scalars())
             issues=[];checked=0
