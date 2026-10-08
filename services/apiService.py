@@ -7,6 +7,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import sys
 import json
+from datetime import date, datetime
+from decimal import Decimal
 from flask import Flask, request, jsonify, Response, redirect
 from flask_restx import Api, Resource, fields, reqparse, abort
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -2369,6 +2371,19 @@ class ProvisioningSnapshot(Resource):
         try:return cxProvisioning.snapshot(),200
         except Exception as error:return handle_exception(error)
 
+def _cx_json_safe(value):
+    """Convert diagnostic data to Flask-RESTX JSON-safe primitives."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _cx_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_cx_json_safe(item) for item in value]
+    return value
+
+
 @ns_provisioning.route('/cx/<int:ims_subscriber_id>/')
 class ProvisionCxProfile(Resource):
     @auth_required
@@ -2390,7 +2405,7 @@ class ProvisionCxProfile(Resource):
                         'source':'explicit' if connection.execute(
                             sqlalchemy.select(repo.profiles.c.ims_subscriber_id).where(
                             repo.profiles.c.ims_subscriber_id==ims_subscriber_id)).first() else 'legacy_ifc',
-                        'definition':profile['definition'],'state':state,'saa_xml_by_set':xml},200
+                        'definition':profile['definition'],'state':_cx_json_safe(state),'saa_xml_by_set':xml},200
         except Exception as error:return handle_exception(error)
 
     @auth_required
