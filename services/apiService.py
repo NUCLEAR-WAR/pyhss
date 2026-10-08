@@ -2384,6 +2384,49 @@ def _cx_json_safe(value):
     return value
 
 
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/audit/')
+class ProvisionCxAudit(Resource):
+    @auth_required
+    def get(self, ims_subscriber_id):
+        """Read-only ownership and identity-policy audit; no secrets or credential hashes."""
+        try:
+            repo = cxProvisioning.repo
+            with repo.engine.connect() as connection:
+                record = repo.record(ims_subscriber_id, connection)
+                definition = repo.definition(record, connection)
+                profile_row = connection.execute(sqlalchemy.select(repo.profiles.c.ims_subscriber_id).where(
+                    repo.profiles.c.ims_subscriber_id == ims_subscriber_id)).first()
+                groups = {}
+                private_ids = set(definition['private_identities'])
+                for public in definition['public_identities']:
+                    group = groups.setdefault(public['set_id'], {'public_identities': [], 'non_barred_count': 0})
+                    group['public_identities'].append({
+                        'identity': public['identity'],
+                        'barred': public['barred'],
+                        'can_register': public.get('can_register', True),
+                        'private_identities': public['private_identities']})
+                    group['non_barred_count'] += int(not public['barred'])
+                warnings = []
+                for name, group in groups.items():
+                    if not group['non_barred_count']:
+                        warnings.append('No unbarred IMPU in IRS ' + name)
+                    for item in group['public_identities']:
+                        if not set(item['private_identities']).issubset(private_ids):
+                            warnings.append('Unknown IMPI association in IRS ' + name)
+                return _cx_json_safe({
+                    'ims_subscriber_id': ims_subscriber_id,
+                    'owner_exists': True,
+                    'source': 'explicit' if profile_row else 'legacy_ifc',
+                    'private_identity_count': len(private_ids),
+                    'public_identity_count': len(definition['public_identities']),
+                    'registration_sets': groups,
+                    'warnings': warnings,
+                    'valid': not warnings,
+                    'note': 'Read-only configuration audit; does not prove S-CSCF Contact state or 3GPP interoperability.'
+                }), 200
+        except Exception as error:
+            return handle_exception(error)
+
 @ns_provisioning.route('/cx/<int:ims_subscriber_id>/')
 class ProvisionCxProfile(Resource):
     @auth_required
