@@ -149,6 +149,12 @@ class CxRepository:
         for item in d['public_identities']:
             associations=set(item['private_identities'])
             if sets.setdefault(item['set_id'],associations)!=associations:raise ValueError('Implicitly registered identities must have consistent private associations')
+        # A registration set needs at least one non-barred public identity.
+        # The barred IMSI-derived IMPU remains present in the SAA XML, but
+        # must not become the only usable associated public identity.
+        for set_id in sets:
+            if not any(not p['barred'] for p in d['public_identities'] if p['set_id']==set_id):
+                raise ValueError('Implicit registration set has no non-barred public identity: '+set_id)
         d.setdefault('authentication_scheme','Digest-AKAv1-MD5')
         if d['authentication_scheme'] not in ('Digest-AKAv1-MD5','SIP Digest'):raise ValueError('Unsupported provisioned authentication scheme')
         schemes=d.get('authentication_schemes',{})
@@ -177,9 +183,21 @@ class CxRepository:
         return [value] if isinstance(value,str) else list(value)
 
     def provision(self,profile_id,definition,replace=False,clear_authentication_pending=False):
-        d=self.validate_definition(definition)
+        # Missing barring flags inherit the subscriber's provisioned iFC XML.
+        # Explicit True/False remains authoritative for intentional changes.
         with self.transaction([profile_id]) as c:
             record=self.record(profile_id,c)
+            definition=deepcopy(definition)
+            try:
+                template=self.legacy_profile(record)
+                template_barring={p['identity']:p['barred'] for p in template['public_identities']}
+            except (ValueError,ET.ParseError,jinja2.TemplateError):
+                template_barring={}
+            for item in definition.get('public_identities',[]):
+                key=public_key(item['identity'])
+                if 'barred' not in item and key in template_barring:
+                    item['barred']=template_barring[key]
+            d=self.validate_definition(definition)
             present=c.execute(select(self.profiles).where(self.profiles.c.ims_subscriber_id==profile_id)).first()
             if present and not replace:raise ValueError('Cx profile exists; use explicit replacement')
             state=c.execute(select(self.states).where(self.states.c.ims_subscriber_id==profile_id)).mappings().first()
