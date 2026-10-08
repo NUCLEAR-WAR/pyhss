@@ -3135,9 +3135,10 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Got MAR for public_identity : " + str(public_identity), redisClient=self.redisMessaging)
         username = self.get_avp_data(avps, 1)[0]
         username = binascii.unhexlify(username).decode('utf-8')
-        # Cx User-Name is the IMPI; it is not an IMSI or an IMSI-derived URI.
+        # The Cx User-Name is an IMPI, never an IMSI lookup key.
+        # Resolve the exact provisioned IMPU/IMPI association to the IMS subscription.
         imsi = None
-        domain = None
+        domain = username.partition('@')[2]
         self.logTool.log(service='HSS', level='debug', message="Got MAR username: " + str(username), redisClient=self.redisMessaging)
         auth_scheme = ''
 
@@ -3150,12 +3151,16 @@ class Diameter:
         avp += self.generate_avp(296, 40, self.OriginRealm)                                                   #Origin Realm        
 
         try:
-            ims_details = self.database.Get_IMS_Subscriber_By_Identity(impu=public_identity, impi=username)
-            imsi = ims_details['imsi']
+            ims_identity = self.database.Get_IMS_Subscriber_By_Identity(
+                impu=public_identity, impi=username)
+            imsi = ims_identity['imsi']
             subscriber_details = self.database.Get_Subscriber(imsi=imsi)
-        except:
+        except Exception as identity_error:
+            self.logTool.log(service='HSS', level='warning',
+                message='Cx MAR identity lookup failed: ' + str(identity_error),
+                redisClient=self.redisMessaging)
             #Handle if the subscriber is not present in HSS return "DIAMETER_ERROR_USER_UNKNOWN"
-            self.logTool.log(service='HSS', level='debug', message="Subscriber " + str(username) + " unknown or unbound in HSS for MAA", redisClient=self.redisMessaging)
+            self.logTool.log(service='HSS', level='debug', message="Subscriber " + str(imsi) + " unknown in HSS for MAA", redisClient=self.redisMessaging)
             self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
                                             metricType='counter', metricAction='inc', 
                                             metricValue=1.0, 
@@ -3163,7 +3168,7 @@ class Diameter:
                                                         "diameter_application_id": 16777216,
                                                         "diameter_cmd_code": 303,
                                                         "event": "Unknown User",
-                                                        "imsi_prefix": str(imsi or "unknown")[:6]},
+                                                        "imsi_prefix": str(imsi[0:6])},
                                             metricHelp='Diameter Authentication related Counters',
                                             metricExpiry=60,
                                             usePrefix=True, 
@@ -3197,7 +3202,7 @@ class Diameter:
                                                             "diameter_application_id": 16777216,
                                                             "diameter_cmd_code": 302,
                                                             "event": "ReAuth",
-                                                            "imsi_prefix": str(imsi or "unknown")[:6]},
+                                                            "imsi_prefix": str(imsi[0:6])},
                                                 metricHelp='Diameter Authentication related Counters',
                                                 metricExpiry=60,
                                                 usePrefix=True, 
