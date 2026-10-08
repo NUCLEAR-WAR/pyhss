@@ -41,6 +41,24 @@ def test_bad_ifc_rolls_back_auc_subscriber_ims_and_cx(lab):
     with pytest.raises(Exception):svc.create_service(payload)
     assert totals(d)==before
 
+def test_tel_public_identities_are_global_in_actual_saa_after_provisioning_and_legacy_cleanup(lab):
+    import xml.etree.ElementTree as ET
+    d,_=lab;svc=CxProvisioning(d.database,config);payload=bundle(d)
+    ims=svc.create_service(payload)['ims_subscriber'];ident=ims['ims_subscriber_id']
+    private=ims['cx']['provisioning']['private_identity'];public='sip:+'+payload['subscriber']['msisdn']+'@'+REALM
+    # Reproduce the prior generated compatibility TEL entry in a stored profile.
+    legacy=deepcopy(ims['cx']);bare='tel:'+payload['subscriber']['msisdn']
+    legacy['public_identities'].append({'identity':bare,'set_id':'fixed','barred':False,'private_identities':legacy['private_identities']})
+    legacy['provisioning']['managed_public'].append(bare)
+    svc.repo.provision(ident,legacy,replace=True)
+    svc.save({'cx':{'authentication':'sip_digest'}},ident)
+    with d.database.engine.connect() as c:assert c.scalar(select(func.count()).select_from(svc.repo.identities).where(svc.repo.identities.c.identity==bare))==0
+    avps,_=mar(d,private,public,'SIP Digest');assert result(d,avps)==('base',2001)
+    avps,_=sar(d,1,private,public);assert result(d,avps)==('base',2001)
+    xml=ET.fromstring(bytes.fromhex(d.get_avp_data(avps,606)[0]))
+    tels=[node.text for node in xml.findall('.//PublicIdentity/Identity') if node.text.startswith('tel:')]
+    assert tels and all(uri.startswith('tel:+') or ';phone-context=' in uri for uri in tels)
+
 def test_identity_conflict_rolls_back_all_native_rows(lab):
     d,profiles=lab;svc=CxProvisioning(d.database,config);payload=bundle(d)
     with d.database.engine.connect() as c:old=d.cx.repo.definition(profiles[0][0],c)

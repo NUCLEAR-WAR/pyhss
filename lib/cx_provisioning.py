@@ -76,7 +76,10 @@ class CxProvisioning:
         # Generated from provisioned fields, never derived from an incoming REGISTER.
         private=[primary];public=[];aliases={}
         for number in numbers(record):
-            for identity in ('sip:'+number+'@'+realm,'tel:'+number,'sip:'+number[1:]+'@'+realm,'tel:'+number[1:]):
+            # The no-plus SIP user is an explicit compatibility identity. TEL
+            # public identities use global E.164 notation; a bare local TEL
+            # URI would require phone-context (RFC 3966 sections 5.1/5.1.5).
+            for identity in ('sip:'+number+'@'+realm,'tel:'+number,'sip:'+number[1:]+'@'+realm):
                 public.append({'identity':identity,'set_id':set_id})
             if mode!='aka':
                 for alias in (number+'@'+realm,number[1:]+'@'+realm):
