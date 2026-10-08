@@ -1656,9 +1656,22 @@ class Diameter:
             return self.generate_vendor_avp(1001, "c0", 10415, ChargingRuleDef)
 
     def Get_IMS_Subscriber_Details_from_AVP(self, username):
-        """Cx Public-Identity (601) is an exact SIP/TEL URI, not an IMSI."""
-        public_identity = binascii.unhexlify(username).decode('utf-8')
-        return self.database.Get_IMS_Subscriber_By_Identity(impu=public_identity)
+        #Feed the Username AVP with Tel URI, SIP URI and either MSISDN or IMSI and this returns user data
+        username = binascii.unhexlify(username).decode('utf-8')
+        self.logTool.log(service='HSS', level='debug', message="Username AVP is present, value is " + str(username), redisClient=self.redisMessaging)
+        username = username.split('@')[0]   #Strip Domain to get User part
+        username = username[4:]             #Strip tel: or sip: prefix
+        #Determine if dealing with IMSI or MSISDN
+        if (len(username) == 15) or (len(username) == 16):
+            self.logTool.log(service='HSS', level='debug', message="We have an IMSI: " + str(username), redisClient=self.redisMessaging)
+            ims_subscriber_details = self.database.Get_IMS_Subscriber(imsi=username)
+        else:
+            self.logTool.log(service='HSS', level='debug', message="We have an msisdn: " + str(username), redisClient=self.redisMessaging)
+            if username[0] == '+':
+                username = username[1:]
+            ims_subscriber_details = self.database.Get_IMS_Subscriber(msisdn=username)
+        self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(ims_subscriber_details), redisClient=self.redisMessaging)
+        return ims_subscriber_details
 
     def clear_expired_emergency_subscribers(self) -> bool:
         """
@@ -2911,22 +2924,45 @@ class Diameter:
             remote_peer = OriginHost
         self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777216_300] [UAR] Remote Peer is " + str(remote_peer), redisClient=self.redisMessaging)
 
-        # Cx UAR: AVP 1 = IMPI, AVP 601 = IMPU. No IMSI inference.
+        imsi = ""
         try:
-            private_identity = binascii.unhexlify(self.get_avp_data(avps, 1)[0]).decode('utf-8')
-            public_identity = binascii.unhexlify(self.get_avp_data(avps, 601)[0]).decode('utf-8')
-            ims_subscriber_details = self.database.Get_IMS_Subscriber_By_Identity(
-                impu=public_identity, impi=private_identity)
+            self.logTool.log(service='HSS', level='debug', message="Checking if username present", redisClient=self.redisMessaging)
+            username = self.get_avp_data(avps, 1)[0]                                                     
+            username = binascii.unhexlify(username).decode('utf-8')
+            self.logTool.log(service='HSS', level='debug', message="Username AVP is present, value is " + str(username), redisClient=self.redisMessaging)
+            # Cx UAR: AVP 601 is the public identity. AVP 1 is an IMPI,
+            # NOT an IMSI. Do not strip '+' from E.164 numbers for routing.
+            public_avps = self.get_avp_data(avps, 601)
+            if not public_avps:
+                raise ValueError("Missing Cx Public-Identity (601)")
+            public_identity = binascii.unhexlify(public_avps[0]).decode('utf-8')
+            ims_subscriber_details = self.database.Resolve_IMS_Public_Identity(public_identity)
             imsi = ims_subscriber_details['imsi']
-        except Exception as exc:
-            self.logTool.log(service='HSS', level='warning',
-                message='Cx UAR identity association not found: ' + str(exc),
-                redisClient=self.redisMessaging)
-            experimental = self.generate_avp(266, 40, self.int_to_hex(10415, 4))
-            experimental += self.generate_avp(298, 40, self.int_to_hex(5001, 4))
-            avp += self.generate_avp(297, 40, experimental)
-            return self.generate_diameter_packet('01', '40', 300, 16777216,
-                packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            self.logTool.log(service='HSS', level='debug', message="UAR IMPU resolved: " + public_identity + " -> subscriber " + str(imsi), redisClient=self.redisMessaging)
+        except Exception as E:
+            self.logTool.log(service='HSS', level='debug', message="Threw Exception: " + str(E), redisClient=self.redisMessaging)
+            self.logTool.log(service='HSS', level='debug', message=f"No known MSISDN or IMSI in Answer_16777216_300()", redisClient=self.redisMessaging)
+            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                            metricType='counter', metricAction='inc', 
+                                            metricValue=1.0, 
+                                            metricLabels={
+                                                        "diameter_application_id": 16777216,
+                                                        "diameter_cmd_code": 300,
+                                                        "event": "Unknown User",
+                                                        "imsi_prefix": str(imsi[0:6])},
+                                            metricHelp='Diameter Authentication related Counters',
+                                            metricExpiry=60,
+                                            usePrefix=True, 
+                                            prefixHostname=self.hostname, 
+                                            prefixServiceName='metric')
+            result_code = 5001          #IMS User Unknown
+            #Experimental Result AVP
+            avp_experimental_result = ''
+            avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
+            avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
+            avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
+            response = self.generate_diameter_packet("01", "40", 300, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
+            return response
 
         #Determine SAR Type & Store
         user_authorization_type_avp_data = self.get_avp_data(avps, 623)
@@ -3015,7 +3051,7 @@ class Diameter:
             avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
             avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
             avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
-            response = self.generate_diameter_packet("01", "40", 301, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
+            response = self.generate_diameter_packet("01", "40", 301, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
             return response
 
         avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(str(imsi) + '@' + str(domain))),'ascii'))
@@ -3135,10 +3171,8 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Got MAR for public_identity : " + str(public_identity), redisClient=self.redisMessaging)
         username = self.get_avp_data(avps, 1)[0]
         username = binascii.unhexlify(username).decode('utf-8')
-        # The Cx User-Name is an IMPI, never an IMSI lookup key.
-        # Resolve the exact provisioned IMPU/IMPI association to the IMS subscription.
-        imsi = None
-        domain = username.partition('@')[2]
+        imsi = username.split('@')[0]   #Strip Domain
+        domain = username.split('@')[1] #Get Domain Part
         self.logTool.log(service='HSS', level='debug', message="Got MAR username: " + str(username), redisClient=self.redisMessaging)
         auth_scheme = ''
 
@@ -3151,14 +3185,8 @@ class Diameter:
         avp += self.generate_avp(296, 40, self.OriginRealm)                                                   #Origin Realm        
 
         try:
-            ims_identity = self.database.Get_IMS_Subscriber_By_Identity(
-                impu=public_identity, impi=username)
-            imsi = ims_identity['imsi']
-            subscriber_details = self.database.Get_Subscriber(imsi=imsi)
-        except Exception as identity_error:
-            self.logTool.log(service='HSS', level='warning',
-                message='Cx MAR identity lookup failed: ' + str(identity_error),
-                redisClient=self.redisMessaging)
+            subscriber_details = self.database.Get_Subscriber(imsi=imsi)                                               #Get subscriber details
+        except:
             #Handle if the subscriber is not present in HSS return "DIAMETER_ERROR_USER_UNKNOWN"
             self.logTool.log(service='HSS', level='debug', message="Subscriber " + str(imsi) + " unknown in HSS for MAA", redisClient=self.redisMessaging)
             self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
@@ -3215,14 +3243,14 @@ class Diameter:
 
         self.logTool.log(service='HSS', level='debug', message="IMSI is " + str(imsi), redisClient=self.redisMessaging)        
         avp += self.generate_vendor_avp(601, "c0", 10415, str(binascii.hexlify(str.encode(public_identity)),'ascii'))               #Public Identity (IMSI)
-        avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(username)),'ascii'))                                    #Username
+        avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(imsi + "@" + domain)),'ascii'))                                    #Username
 
     
 
         #Determine Vectors to Generate
         if auth_scheme == "Digest-MD5":
             self.logTool.log(service='HSS', level='debug', message="Generating MD5 Challenge", redisClient=self.redisMessaging)
-            vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "Digest-MD5", username=username, plmn=plmn)
+            vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "Digest-MD5", username=imsi, plmn=plmn)
             avp_SIP_Item_Number = self.generate_vendor_avp(613, "c0", 10415, format(int(0),"x").zfill(8))
             avp_SIP_Authentication_Scheme = self.generate_vendor_avp(608, "c0", 10415, str(binascii.hexlify(b'Digest-MD5'),'ascii'))
             #Nonce
