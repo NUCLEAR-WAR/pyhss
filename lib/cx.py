@@ -156,10 +156,20 @@ class CxService:
         requested=self.text(children,608,VENDOR)
         token_avp=self.one(children,610,VENDOR,False)
         profile=self.repo.resolve(public,private);scheme=self.authentication_scheme(profile,requested)
+        if scheme=='SIP Digest':
+            canonical=profile['definition'].get('digest_identity_aliases',{}).get(profile['private'])
+            if canonical:
+                # Explicit operator-provisioned lookup alias, not a learned
+                # association or a guess from IMSI/MSISDN. MAA identifies the
+                # actual owner of the returned HA1, which Kamailio caches.
+                profile=self.repo.resolve(public,canonical)
+                self.authentication_scheme(profile,'SIP Digest')
+                private=profile['private']
         self.authorize(profile)
         maximum=int(self.settings.get('max_auth_items',5))
         if maximum<1:raise ValueError('max_auth_items must be positive')
         count=min(count,maximum)
+        if scheme=='SIP Digest':count=1  # TS 29.228 Table 6.3.4
         payload=self.avp(1,private)+self.avp(601,public,VENDOR);vectors=''
         with self.repo.transaction([profile['record']['ims_subscriber_id']]) as c:
             state=self.repo.state(profile,c);sub,auc=self.repo.credential(profile,c)
@@ -168,7 +178,7 @@ class CxService:
                 realm=profile['definition']['digest_realm'];secret=auc['ki']
                 ha1=hashlib.md5(f'{private}:{realm}:{secret}'.encode()).hexdigest()
                 digest=self.grouped(635,self.avp(104,realm)+self.avp(111,'MD5')+self.avp(110,'auth')+self.avp(121,ha1))
-                for number in range(count):vectors+=self.grouped(612,self.avp(613,number,VENDOR,True)+self.avp(608,'SIP Digest',VENDOR)+digest)
+                vectors=self.grouped(612,self.avp(608,'SIP Digest',VENDOR)+digest)
             else:
                 key=bytes.fromhex(auc['ki']);opc=bytes.fromhex(auc['opc']);amf=bytes.fromhex(auc['amf'])
                 if len(key)!=16 or len(opc)!=16 or len(amf)!=2:raise ValueError('Invalid provisioned AKA credentials')
@@ -251,12 +261,21 @@ class CxService:
                     group['pending']=[p for p in group['pending'] if p!=profile['private']]
                 else:
                     if private is None and len(group['registered'])>1:raise CxError(5005,False,(1,0,''))
+                    had_service_assignment=group['state'] in ('registered','unregistered')
                     group['registered']=[p for p in group['registered'] if private and p!=private_key(private)]
                     group['pending']=[p for p in group['pending'] if private and p!=private_key(private)]
                     keep=typ in (6,7) and self.settings.get('store_server_on_deregistration',True)
                     if group['registered']:group['state']='registered'
                     elif keep:group['state']='unregistered'
-                    else:group['state']='not_registered'
+                    else:
+                        group['state']='not_registered'
+                        if had_service_assignment:
+                            # TS 29.228 6.1.2: removing the last registration
+                            # without STORE_SERVER_NAME releases this set's
+                            # assignment. Incomplete authentication for a
+                            # bootstrap/other IMPI in the same set cannot pin it.
+                            group['pending']=[]
+                            group['known_private']=[]
                     if typ in (6,7) and not keep:code=2004;experimental=True
                 state['groups'][set_id]=group
                 if not any(g['state'] in ('registered','unregistered') or g['pending'] for g in state['groups'].values()):

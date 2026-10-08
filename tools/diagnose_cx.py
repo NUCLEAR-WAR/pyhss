@@ -54,6 +54,7 @@ def diagnose(engine,private=None,public=None,ifc_report=False):
                     report['identity_association']='valid'
                     report['authentication_scheme']=repo.authentication_scheme(profile)
                     report['allowed_authentication_schemes']=repo.authentication_schemes(profile)
+                    report['digest_authentication_identity']=profile['definition'].get('digest_identity_aliases',{}).get(profile['private'],profile['private'])
                     subscriber=c.execute(select(repo.sub.c.subscriber_id,repo.sub.c.auc_id,repo.sub.c.enabled)
                         .where(repo.sub.c.imsi==profile['record']['imsi'])).mappings().first()
                     if subscriber is None:report['native_credential_link']='subscriber_not_found'

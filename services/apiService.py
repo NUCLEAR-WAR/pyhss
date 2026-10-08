@@ -61,6 +61,9 @@ diameterClient = Diameter(
                 )
 
 databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging)
+from cx_provisioning import CxProvisioning,ProvisioningConflict
+from cx_repository import CxError
+cxProvisioning = CxProvisioning(databaseClient,config)
 
 apiService = Flask(__name__)
 
@@ -154,7 +157,12 @@ EMERGENCY_SUBSCRIBER_model = api.schema_model('EMERGENCY_SUBSCRIBER JSON',
 imsSubscriberModel = databaseClient.Generate_JSON_Model_for_Flask(IMS_SUBSCRIBER)
 imsSubscriberModel['sh_profile'] = fields.String(required=False, description=IMS_SUBSCRIBER.sh_profile.doc),
 
-IMS_SUBSCRIBER_model = api.schema_model('IMS_SUBSCRIBER JSON', databaseClient.Generate_JSON_Model_for_Flask(IMS_SUBSCRIBER))
+imsSubscriberSchema = databaseClient.Generate_JSON_Model_for_Flask(IMS_SUBSCRIBER)
+imsSubscriberSchema['properties']['cx'] = {'type':'object','description':'Static Cx provisioning policy or complete profile. Omit for configured/default AKA; fixed services select sip_digest explicitly.',
+    'properties':{'authentication':{'type':'string','enum':['aka','sip_digest','dual']},
+                  'realm':{'type':'string'},'private_identity':{'type':'string'},
+                  'service_type':{'type':'string'},'clear_authentication_pending':{'type':'boolean'}}}
+IMS_SUBSCRIBER_model = api.schema_model('IMS_SUBSCRIBER JSON', imsSubscriberSchema)
 
 TFT_model = api.schema_model('TFT JSON', 
     databaseClient.Generate_JSON_Model_for_Flask(TFT)
@@ -301,6 +309,10 @@ def handle_exception(e):
     logTool.log(service='API', level='error', message=f"[API] An error occurred: {e}", redisClient=redisMessaging)
     response_json = {'result': 'Failed'}
 
+    if isinstance(e,ProvisioningConflict):
+        return {'result':'Failed','reason':str(e)},409
+    if isinstance(e,LookupError) or (isinstance(e,CxError) and e.code==5001):
+        return {'result':'Failed','reason':'IMS subscriber not found'},404
     if isinstance(e, sqlalchemy.exc.SQLAlchemyError):
         response_json['reason'] = f'A database integrity error occurred: {e}'
         return response_json, 400
@@ -315,6 +327,8 @@ def handle_exception(e):
         if "CSV file does not exist" in error_message:
             response_json['reason'] = f'EIR CSV file is not defined / does not exist'
             return response_json, 410
+        response_json['reason'] = error_message
+        return response_json,400
     else:
         response_json['reason'] = f'An internal server error occurred: {e}'
         logTool.log(service='API', level='error', message=f"[API] Additional Error Information: {traceback.format_exc()}\n{sys.exc_info()[2]}", redisClient=redisMessaging)
@@ -725,7 +739,7 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
     def get(self, ims_subscriber_id):
         '''Get all SUBSCRIBER data for specified ims_subscriber_id'''
         try:
-            apn_data = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
+            apn_data = cxProvisioning.get(ims_subscriber_id)
             return apn_data, 200
         except Exception as E:
             print(E)
@@ -736,7 +750,7 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
         try:
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
-            data = databaseClient.DeleteObj(IMS_SUBSCRIBER, ims_subscriber_id, False, operation_id)
+            data = cxProvisioning.remove(ims_subscriber_id,operation_id)
             return data, 200
         except Exception as E:
             print(E)
@@ -748,13 +762,9 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
         '''Update IMS SUBSCRIBER data for specified ims_subscriber'''
         try:
             json_data = request.get_json(force=True)
-            if 'msisdn' in json_data:
-                json_data['msisdn'] = json_data['msisdn'].replace('+', '')
-            if 'msisdn_list' in json_data:
-                json_data['msisdn_list'] = json_data['msisdn_list'].replace('+', '')
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
-            data = databaseClient.UpdateObj(IMS_SUBSCRIBER, json_data, ims_subscriber_id, False, operation_id)
+            data = cxProvisioning.save(json_data,ims_subscriber_id,operation_id)
 
             return data, 200
         except Exception as E:
@@ -769,13 +779,9 @@ class PyHSS_IMS_SUBSCRIBER(Resource):
         '''Create new IMS SUBSCRIBER'''
         try:
             json_data = request.get_json(force=True)
-            if 'msisdn' in json_data:
-                json_data['msisdn'] = json_data['msisdn'].replace('+', '')
-            if 'msisdn_list' in json_data:
-                json_data['msisdn_list'] = json_data['msisdn_list'].replace('+', '')
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
-            data = databaseClient.CreateObj(IMS_SUBSCRIBER, json_data, False, operation_id)
+            data = cxProvisioning.save(json_data,operation_id=operation_id)
 
             return data, 200
         except Exception as E:
@@ -787,7 +793,8 @@ class PyHSS_IMS_SUBSCRIBER_MSISDN(Resource):
     def get(self, msisdn):
         '''Get IMS data for MSISDN'''
         try:
-            data = databaseClient.Get_IMS_Subscriber(msisdn=msisdn)
+            native = databaseClient.Get_IMS_Subscriber(msisdn=msisdn.lstrip('+'))
+            data = cxProvisioning.get(native['ims_subscriber_id'])
             return data, 200
         except Exception as E:
             print("Flask Exception: " + str(E))
@@ -798,7 +805,8 @@ class PyHSS_IMS_SUBSCRIBER_IMSI(Resource):
     def get(self, imsi):
         '''Get IMS data for imsi'''
         try:
-            data = databaseClient.Get_IMS_Subscriber(imsi=imsi)
+            native = databaseClient.Get_IMS_Subscriber(imsi=imsi)
+            data = cxProvisioning.get(native['ims_subscriber_id'])
             return data, 200
         except Exception as E:
             print("Flask Exception: " + str(E))
@@ -2342,5 +2350,47 @@ def main():
     apiService.run(debug=False, host=host, port=port)
 
 
+# Provisioning shares the native engine used by Diameter. All mutation routes
+# inherit the normal Provisioning-Key policy through auth_before_request.
+ns_provisioning = api.namespace('provisioning',description='Atomic native subscriber and Cx provisioning')
+
+@ns_provisioning.route('/options/')
+class ProvisioningOptions(Resource):
+    def get(self):
+        try:return cxProvisioning.options(),200
+        except Exception as error:return handle_exception(error)
+
+@ns_provisioning.route('/snapshot/')
+class ProvisioningSnapshot(Resource):
+    @auth_required
+    def get(self):
+        try:return cxProvisioning.snapshot(),200
+        except Exception as error:return handle_exception(error)
+
+@ns_provisioning.route('/subscriber/')
+class ProvisionSubscriberService(Resource):
+    def put(self):
+        """Create AuC, subscriber and optional IMS/Cx records atomically."""
+        try:
+            payload=request.get_json(force=True)
+            args=parser.parse_args()
+            return cxProvisioning.create_service(payload,args.get('operation_id')),200
+        except sqlalchemy.exc.IntegrityError:
+            return {'result':'Failed','reason':'Subscriber provisioning conflicts with existing data; no partial service was created'},409
+        except Exception as error:return handle_exception(error)
+
+@ns_provisioning.route('/subscriber/<int:subscriber_id>')
+class UpdateSubscriberService(Resource):
+    def patch(self,subscriber_id):
+        """Update subscriber, credentials and IMS/Cx data in one native transaction."""
+        try:
+            args=parser.parse_args()
+            return cxProvisioning.update_service(subscriber_id,request.get_json(force=True),args.get('operation_id')),200
+        except sqlalchemy.exc.IntegrityError:
+            return {'result':'Failed','reason':'Subscriber update conflicts with existing data; no partial service update was committed'},409
+        except Exception as error:return handle_exception(error)
+
 if __name__ == '__main__':
     main()
+
+

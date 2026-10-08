@@ -16,7 +16,9 @@ from copy import deepcopy
 def preserve_definition(existing,additional,allow_additional_scheme=False,associate_existing_public=False):
     """Explicit operator merge; never infer authentication policy from a request."""
     base=CxRepository.validate_definition(existing)
-    extra=CxRepository.validate_definition(additional)
+    # An operator's extension can contain only a barred existing IMPU. Check
+    # usability on the complete merged sets, before any database write.
+    extra=CxRepository.validate_definition(additional,allow_partial_sets=True)
     if base['digest_realm']!=extra['digest_realm']:
         raise ValueError('Use an explicit JSON profile for identities with different Digest realms')
     schemes=deepcopy(base.get('authentication_schemes',{}))
@@ -53,6 +55,7 @@ def preserve_definition(existing,additional,allow_additional_scheme=False,associ
             item['private_identities']=list(dict.fromkeys(item['private_identities']+
                 [private for private in base['private_identities'] if private in extended_sets[item['set_id']]]))
     base['visited_networks']=list(dict.fromkeys((base.get('visited_networks') or [base['digest_realm']])+extra.get('visited_networks',[])))
+    base.setdefault('digest_identity_aliases',{}).update(extra.get('digest_identity_aliases',{}))
     return CxRepository.validate_definition(base)
 
 def main():
@@ -71,6 +74,7 @@ def main():
     p.add_argument('--allow-additional-scheme',action='store_true',help='Explicitly allow another scheme for an existing private identity while preserving its current scheme')
     p.add_argument('--associate-existing-public',action='store_true',help='Explicitly add the supplied private identities to existing public identities and their entire implicit registration set')
     p.add_argument('--clear-authentication-pending',action='store_true',help='Cancel only unfinished authentication before profile replacement; refuses registered or stored unregistered service state')
+    p.add_argument('--digest-identity-alias',nargs=2,action='append',metavar=('LOOKUP_IMPI','AUTHENTICATION_IMPI'),help='Explicit SIP Digest lookup alias and actual authentication identity; repeat for additional aliases')
     p.add_argument('--replace',action='store_true',help='Replace an existing explicitly provisioned profile after de-registration')
     args=p.parse_args()
     if args.allow_additional_scheme and not args.preserve_existing:
@@ -80,7 +84,7 @@ def main():
     if args.clear_authentication_pending and not args.replace:
         p.error('--clear-authentication-pending requires --replace')
     inline=any((args.private_identity,args.public_identity,args.authentication_scheme,args.digest_realm,
-                args.visited_network,args.unregistered_service,args.set_id!='default'))
+                args.visited_network,args.unregistered_service,args.set_id!='default',args.digest_identity_alias))
     if args.profile and inline:p.error('Choose either --profile or explicit identity/policy arguments')
     if not args.profile:
         if not all((args.private_identity,args.public_identity,args.authentication_scheme,args.visited_network)):
@@ -90,7 +94,8 @@ def main():
             'public_identities':[{'identity':identity,'set_id':args.set_id,'barred':False} for identity in args.public_identity],
             'authentication_scheme':args.authentication_scheme,
             'digest_realm':args.digest_realm or args.private_identity[0].rpartition('@')[2],
-            'visited_networks':args.visited_network,'unregistered_service':args.unregistered_service}
+            'visited_networks':args.visited_network,'unregistered_service':args.unregistered_service,
+            'digest_identity_aliases':dict(args.digest_identity_alias or [])}
     else:definition=json.loads(Path(args.profile).read_text())
     db=Database(LogTool(config),main_service=False);repo=CxRepository(db,config)
     with db.engine.connect() as c:

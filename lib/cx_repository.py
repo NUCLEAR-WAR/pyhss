@@ -6,7 +6,7 @@ Identity provisioning is separate from registration. No UAR/MAR/SAR handler
 inserts a private/public identity association. Legacy IFCs remain a read-only
 source of provisioned identities until explicit profiles are provisioned.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager,nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,7 +132,7 @@ class CxRepository:
         return self.validate_definition(json.loads(row[0]) if row else self.legacy_profile(record))
 
     @staticmethod
-    def validate_definition(definition):
+    def validate_definition(definition,allow_partial_sets=False):
         d=deepcopy(definition)
         d['private_identities']=[private_key(x) for x in d['private_identities']]
         if not d['private_identities'] or len(set(d['private_identities']))!=len(d['private_identities']):raise ValueError('Duplicate/empty private identities')
@@ -149,11 +149,9 @@ class CxRepository:
         for item in d['public_identities']:
             associations=set(item['private_identities'])
             if sets.setdefault(item['set_id'],associations)!=associations:raise ValueError('Implicitly registered identities must have consistent private associations')
-        # A registration set needs at least one non-barred public identity.
-        # The barred IMSI-derived IMPU remains present in the SAA XML, but
-        # must not become the only usable associated public identity.
+        # Preserve the fork's barring rule: an implicit set must remain usable.
         for set_id in sets:
-            if not any(not p['barred'] for p in d['public_identities'] if p['set_id']==set_id):
+            if not allow_partial_sets and not any(not item['barred'] for item in d['public_identities'] if item['set_id']==set_id):
                 raise ValueError('Implicit registration set has no non-barred public identity: '+set_id)
         d.setdefault('authentication_scheme','Digest-AKAv1-MD5')
         if d['authentication_scheme'] not in ('Digest-AKAv1-MD5','SIP Digest'):raise ValueError('Unsupported provisioned authentication scheme')
@@ -167,6 +165,20 @@ class CxRepository:
                 raise ValueError('Private authentication policy must contain distinct scheme names')
             if any(scheme not in ('Digest-AKAv1-MD5','SIP Digest') for scheme in allowed):
                 raise ValueError('Unsupported private identity authentication scheme')
+        aliases=d.get('digest_identity_aliases',{})
+        if not isinstance(aliases,dict):raise ValueError('digest_identity_aliases must map lookup identities to authentication identities')
+        d['digest_identity_aliases']={private_key(source):private_key(target) for source,target in aliases.items()}
+        for source,target in d['digest_identity_aliases'].items():
+            if source==target or source not in d['private_identities'] or target not in d['private_identities']:
+                raise ValueError('Digest aliases must reference distinct provisioned private identities')
+            if target in d['digest_identity_aliases']:raise ValueError('Chained or cyclic Digest identity aliases are not supported')
+            for identity in (source,target):
+                schemes=d['authentication_schemes'].get(identity,d['authentication_scheme'])
+                if 'SIP Digest' not in ([schemes] if isinstance(schemes,str) else schemes):
+                    raise ValueError('Both Digest alias identities must explicitly allow SIP Digest')
+            for public in d['public_identities']:
+                if source in public['private_identities'] and target not in public['private_identities']:
+                    raise ValueError('Digest alias target must be associated with every public identity served by its lookup alias')
         d.setdefault('digest_realm',d['private_identities'][0].rpartition('@')[2])
         if not isinstance(d['digest_realm'],str) or not d['digest_realm']:raise ValueError('Digest realm must be provisioned')
         d.setdefault('unregistered_service',False)
@@ -182,22 +194,21 @@ class CxRepository:
         value=definition.get('authentication_schemes',{}).get(profile.get('private'),definition['authentication_scheme'])
         return [value] if isinstance(value,str) else list(value)
 
-    def provision(self,profile_id,definition,replace=False,clear_authentication_pending=False):
-        # Missing barring flags inherit the subscriber's provisioned iFC XML.
-        # Explicit True/False remains authoritative for intentional changes.
-        with self.transaction([profile_id]) as c:
+    def prepare_definition(self,record,definition):
+        # Missing flags inherit rendered IFC barring. Explicit booleans win.
+        definition=deepcopy(definition)
+        try:
+            template_barring={item['identity']:item['barred'] for item in self.legacy_profile(record)['public_identities']}
+        except (ValueError,ET.ParseError,jinja2.TemplateError):template_barring={}
+        for item in definition.get('public_identities',[]):
+            key=public_key(item['identity'])
+            if 'barred' not in item and key in template_barring:item['barred']=template_barring[key]
+        return self.validate_definition(definition)
+
+    def provision(self,profile_id,definition,replace=False,clear_authentication_pending=False,connection=None):
+        with (nullcontext(connection) if connection is not None else self.transaction([profile_id])) as c:
             record=self.record(profile_id,c)
-            definition=deepcopy(definition)
-            try:
-                template=self.legacy_profile(record)
-                template_barring={p['identity']:p['barred'] for p in template['public_identities']}
-            except (ValueError,ET.ParseError,jinja2.TemplateError):
-                template_barring={}
-            for item in definition.get('public_identities',[]):
-                key=public_key(item['identity'])
-                if 'barred' not in item and key in template_barring:
-                    item['barred']=template_barring[key]
-            d=self.validate_definition(definition)
+            d=self.prepare_definition(record,definition)
             present=c.execute(select(self.profiles).where(self.profiles.c.ims_subscriber_id==profile_id)).first()
             if present and not replace:raise ValueError('Cx profile exists; use explicit replacement')
             state=c.execute(select(self.states).where(self.states.c.ims_subscriber_id==profile_id)).mappings().first()
