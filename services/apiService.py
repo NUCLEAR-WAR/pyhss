@@ -2492,6 +2492,26 @@ class ProvisionCxDeregister(Resource):
                       if group.get('registered')}
             if not active:
                 return {'status': 'not_registered', 'ims_subscriber_id': ims_subscriber_id}, 409
+            selected_set = body.get('registration_set')
+            if selected_set is None:
+                if len(active) != 1:
+                    return {'status':'scope_required','active_registration_sets':sorted(active)},409
+                selected_set = next(iter(active))
+            if selected_set not in active:
+                return {'status':'invalid_scope','active_registration_sets':sorted(active)},409
+            registered_impis = list(active[selected_set].get('registered') or [])
+            aliases = definition.get('digest_identity_aliases') or {}
+            canonical = list(dict.fromkeys(aliases.get(x,x) for x in registered_impis))
+            selected_impi = body.get('private_identity')
+            if not selected_impi:
+                if len(canonical) != 1:
+                    return {'status':'private_identity_required','registered_private_identities':canonical},409
+                selected_impi = canonical[0]
+            if aliases.get(selected_impi,selected_impi) not in canonical:
+                return {'status':'private_identity_not_registered'},409
+            reason_code = body.get('reason_code',0)
+            if reason_code != 0:
+                return {'status':'unsupported_reason','message':'Only permanent termination (0) is supported in this operation'},400
             peer = state.get('peer')
             scscf = state.get('scscf')
             realm = state.get('realm')
@@ -2509,7 +2529,8 @@ class ProvisionCxDeregister(Resource):
                 request_id, ims_subscriber_id, scscf, destination_host, peer, realm)
             result = await_correlated_answer(
                 diameterClient, 'RTR', hostname=destination_host, peer_hint=peer, timeout=timeout,
-                imsi=record['imsi'], domain=realm, registration_sets=sorted(active),
+                imsi=record['imsi'], domain=realm, registration_sets=[selected_set],
+                private_identity=selected_impi, reason_code=reason_code,
                 destinationHost=destination_host, destinationRealm=realm)
             current_app.logger.warning(
                 '[CxRTR] request_id=%s status=%s diagnostics=%s',
@@ -2518,6 +2539,9 @@ class ProvisionCxDeregister(Resource):
                     ('status', 'operation', 'elapsed_seconds', 'diagnostics')}
             safe['request_id'] = request_id
             safe['ims_subscriber_id'] = ims_subscriber_id
+            safe['registration_set'] = selected_set
+            safe['private_identity'] = selected_impi
+            safe['reason_code'] = reason_code
             safe['active_registration_sets_before_request'] = sorted(active)
             safe['result'] = result.get('result')
             safe['note'] = ('No subscriber deletion or registration-state mutation performed. '

@@ -65,7 +65,7 @@ class Diameter:
         else:
             self.redisMessaging = RedisMessaging(host=self.redisHost, port=self.redisPort, useUnixSocket=self.redisUseUnixSocket, unixSocketPath=self.redisUnixSocketPath)
         
-        self.hostname = socket.gethostname()
+        self.hostname = str(originHost)  # Shared Redis namespace: configured HSS Diameter Origin-Host
 
         self.database = Database(logTool=logTool, main_service=main_service)
         from cx import CxService

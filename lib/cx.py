@@ -314,7 +314,7 @@ class CxService:
             return 2003,self.capabilities(),True
         raise CxError(5003,reason='terminating_unregistered_service_not_available')
 
-    def rtr(self, imsi, destination_host, destination_realm, registration_sets=None):
+    def rtr(self, imsi, destination_host, destination_realm, registration_sets=None, private_identity=None, reason_code=0):
         """Build a Cx RTR for active implicit registration sets.
 
         Public-Identity AVP 601 is mandatory for our Kamailio S-CSCF. Only
@@ -341,18 +341,31 @@ class CxService:
                     public.append(identity['identity'])
             if not public:
                 raise ValueError('RTR has no provisioned public identities in active IRS')
-            known = []
-            for name in selected:
-                group = active[name]
-                for identity in group.get('registered', []):
-                    if identity not in known:
-                        known.append(identity)
-            if not known:
-                raise ValueError('RTR has no registered private identity')
+            if reason_code != 0:
+                raise ValueError('Only permanent termination (reason 0) is enabled for this administrative operation')
             aliases = definition.get('digest_identity_aliases', {})
-            target = aliases.get(known[0], known[0])
+            registered = set()
+            for name in selected:
+                registered.update(aliases.get(x, x) for x in active[name].get('registered', []))
+            if not registered:
+                raise ValueError('RTR has no registered private identity')
+            if not private_identity:
+                if len(registered) != 1:
+                    raise ValueError('Multiple registered IMPIs: specify private_identity for scoped RTR')
+                target = next(iter(registered))
+            else:
+                target = aliases.get(private_identity, private_identity)
+                if target not in registered:
+                    raise ValueError('Requested IMPI is not registered in the selected IRS')
             if target not in definition['private_identities']:
                 raise ValueError('Registered IMPI is not provisioned in this Cx profile')
+            # Do not include an IMPU which is not authorized for the selected IMPI.
+            public = [x['identity'] for x in definition['public_identities']
+                      if x['set_id'] in selected and target in
+                      [aliases.get(i, i) for i in x.get('private_identities', definition['private_identities'])]]
+            public = list(dict.fromkeys(public))
+            if not public:
+                raise ValueError('No associated public identities for selected IMPI and IRS')
         sid = bytes.fromhex(self.d.OriginHost).decode() + ';cx-rtr;' + __import__('uuid').uuid4().hex
         payload = self.avp(263, sid)
         payload += self.d.generate_avp(264, '40', self.d.OriginHost)
@@ -362,7 +375,7 @@ class CxService:
         payload += self.avp(277, 1, integer=True)
         payload += self.avp(293, destination_host) + self.avp(283, destination_realm)
         payload += self.avp(1, target)
-        payload += self.grouped(615, self.avp(616, 0, VENDOR, True)
+        payload += self.grouped(615, self.avp(616, reason_code, VENDOR, True)
                                 + self.avp(617, 'Administrative de-registration', VENDOR))
         for impu in public:
             payload += self.avp(601, impu, VENDOR)
