@@ -2500,7 +2500,7 @@ class ProvisionCxDeregister(Resource):
             # response does not itself authorize deletion or local state clearing.
             from cx_outbound_transactions import await_correlated_answer
             result = await_correlated_answer(
-                diameterClient, 'RTR', hostname=peer, timeout=timeout,
+                diameterClient, 'RTR', hostname=destination_host, peer_hint=peer, timeout=timeout,
                 imsi=record['imsi'], domain=realm,
                 destinationHost=destination_host, destinationRealm=realm)
             safe = {key: result.get(key) for key in
