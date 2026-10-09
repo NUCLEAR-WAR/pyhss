@@ -314,25 +314,58 @@ class CxService:
             return 2003,self.capabilities(),True
         raise CxError(5003,reason='terminating_unregistered_service_not_available')
 
-    def rtr(self,imsi,destination_host,destination_realm):
-        """Terminate a provisioned IMS subscription using its actual private IDs."""
-        with self.repo.engine.connect() as c:
-            records=c.execute(select(self.repo.ims).where(self.repo.ims.c.imsi==imsi)).mappings().all()
-            if len(records)!=1:raise CxError(5001)
-            definition=self.repo.definition(dict(records[0]),c)
-            profile={'record':dict(records[0]),'definition':definition}
-            state=self.repo.state(profile,c)
-            known=[]
-            for group in state['groups'].values():
-                for identity in group.get('known_private',group['registered']):
-                    if identity not in known:known.append(identity)
-            target=known[0] if known else definition['private_identities'][0]
-            target=definition.get('digest_identity_aliases',{}).get(target,target)
-        sid=bytes.fromhex(self.d.OriginHost).decode()+';cx-rtr;'+__import__('uuid').uuid4().hex
-        payload=self.avp(263,sid)+self.d.generate_avp(264,'40',self.d.OriginHost)+self.d.generate_avp(296,'40',self.d.OriginRealm)
-        payload+=self.grouped(260,self.avp(266,VENDOR,integer=True)+self.avp(258,CX_APP,integer=True),vendor=0)
-        payload+=self.avp(277,1,integer=True)+self.avp(293,destination_host)+self.avp(283,destination_realm)+self.avp(1,target)
-        payload+=self.grouped(615,self.avp(616,0,VENDOR,True)+self.avp(617,'Administrative de-registration',VENDOR))
-        associated=[x for x in definition['private_identities'] if x!=target and x not in definition.get('digest_identity_aliases',{})]
-        if associated:payload+=self.grouped(632,''.join(self.avp(1,x) for x in associated))
-        return self.d.generate_diameter_packet('01','c0',304,CX_APP,self.d.generate_id(4),self.d.generate_id(4),payload)
+    def rtr(self, imsi, destination_host, destination_realm, registration_sets=None):
+        """Build a Cx RTR for active implicit registration sets.
+
+        Public-Identity AVP 601 is mandatory for our Kamailio S-CSCF. Only
+        provisioned identities belonging to the selected active IRS are sent.
+        Never derive public identities from an IMSI or incoming SIP URI.
+        """
+        with self.repo.engine.connect() as connection:
+            records = connection.execute(
+                select(self.repo.ims).where(self.repo.ims.c.imsi == imsi)
+            ).mappings().all()
+            if len(records) != 1:
+                raise CxError(5001)
+            record = dict(records[0])
+            definition = self.repo.definition(record, connection)
+            state = self.repo.state({'record': record, 'definition': definition}, connection)
+            active = {name: group for name, group in (state.get('groups') or {}).items()
+                      if group.get('registered')}
+            selected = list(registration_sets) if registration_sets is not None else list(active)
+            if not selected or any(name not in active for name in selected):
+                raise ValueError('RTR requires explicitly registered IRS groups')
+            public = []
+            for identity in definition['public_identities']:
+                if identity['set_id'] in selected and identity['identity'] not in public:
+                    public.append(identity['identity'])
+            if not public:
+                raise ValueError('RTR has no provisioned public identities in active IRS')
+            known = []
+            for name in selected:
+                group = active[name]
+                for identity in group.get('registered', []):
+                    if identity not in known:
+                        known.append(identity)
+            if not known:
+                raise ValueError('RTR has no registered private identity')
+            aliases = definition.get('digest_identity_aliases', {})
+            target = aliases.get(known[0], known[0])
+            if target not in definition['private_identities']:
+                raise ValueError('Registered IMPI is not provisioned in this Cx profile')
+        sid = bytes.fromhex(self.d.OriginHost).decode() + ';cx-rtr;' + __import__('uuid').uuid4().hex
+        payload = self.avp(263, sid)
+        payload += self.d.generate_avp(264, '40', self.d.OriginHost)
+        payload += self.d.generate_avp(296, '40', self.d.OriginRealm)
+        payload += self.grouped(260, self.avp(266, VENDOR, integer=True)
+                                + self.avp(258, CX_APP, integer=True), vendor=0)
+        payload += self.avp(277, 1, integer=True)
+        payload += self.avp(293, destination_host) + self.avp(283, destination_realm)
+        payload += self.avp(1, target)
+        payload += self.grouped(615, self.avp(616, 0, VENDOR, True)
+                                + self.avp(617, 'Administrative de-registration', VENDOR))
+        for impu in public:
+            payload += self.avp(601, impu, VENDOR)
+        return self.d.generate_diameter_packet('01', 'c0', 304, CX_APP,
+                                               self.d.generate_id(4), self.d.generate_id(4), payload)
+

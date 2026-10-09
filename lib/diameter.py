@@ -65,12 +65,7 @@ class Diameter:
         else:
             self.redisMessaging = RedisMessaging(host=self.redisHost, port=self.redisPort, useUnixSocket=self.redisUseUnixSocket, unixSocketPath=self.redisUnixSocketPath)
         
-        # Redis Diameter queues, peer registry and Cx answer mailboxes must use
-        # the same namespace as DiameterService. A container hostname differs
-        # from the configured Diameter Origin-Host in Docker deployments.
-        # This is the *local HSS* namespace, not the destination S-CSCF.
-        self.hostname = str(originHost).strip()
-
+        self.hostname = socket.gethostname()
 
         self.database = Database(logTool=logTool, main_service=main_service)
         from cx import CxService
@@ -4468,9 +4463,9 @@ class Diameter:
         return response
 
     #3GPP Cx Registration Termination Request (RTR)
-    def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm):
+    def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm, registration_sets=None):
         """Cx RTR uses provisioned IMPI rather than reconstructing it from IMSI."""
-        return self.cx.rtr(imsi, destinationHost, destinationRealm)
+        return self.cx.rtr(imsi, destinationHost, destinationRealm, registration_sets=registration_sets)
 
     #3GPP Sh User-Data Request (UDR)
     def Request_16777217_306(self, **kwargs):

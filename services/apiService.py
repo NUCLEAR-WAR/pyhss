@@ -2509,7 +2509,7 @@ class ProvisionCxDeregister(Resource):
                 request_id, ims_subscriber_id, scscf, destination_host, peer, realm)
             result = await_correlated_answer(
                 diameterClient, 'RTR', hostname=destination_host, peer_hint=peer, timeout=timeout,
-                imsi=record['imsi'], domain=realm,
+                imsi=record['imsi'], domain=realm, registration_sets=sorted(active),
                 destinationHost=destination_host, destinationRealm=realm)
             current_app.logger.warning(
                 '[CxRTR] request_id=%s status=%s diagnostics=%s',
