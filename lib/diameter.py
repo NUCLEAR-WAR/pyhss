@@ -4463,9 +4463,20 @@ class Diameter:
         return response
 
     #3GPP Cx Registration Termination Request (RTR)
-    def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm, registration_sets=None):
-        """Cx RTR uses provisioned IMPI rather than reconstructing it from IMSI."""
-        return self.cx.rtr(imsi, destinationHost, destinationRealm, registration_sets=registration_sets)
+    def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm,
+                              registration_sets=None, private_identity=None, reason_code=0):
+        """Generate a scoped Cx RTR using provisioned identities and registration state.
+
+        ``domain`` is retained for compatibility with existing callers. The
+        Diameter destination is supplied explicitly from the subscriber's
+        assigned S-CSCF; it must never be replaced with a default S-CSCF.
+        """
+        return self.cx.rtr(
+            imsi, destinationHost, destinationRealm,
+            registration_sets=registration_sets,
+            private_identity=private_identity,
+            reason_code=reason_code,
+        )
 
     #3GPP Sh User-Data Request (UDR)
     def Request_16777217_306(self, **kwargs):
