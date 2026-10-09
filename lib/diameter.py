@@ -65,7 +65,12 @@ class Diameter:
         else:
             self.redisMessaging = RedisMessaging(host=self.redisHost, port=self.redisPort, useUnixSocket=self.redisUseUnixSocket, unixSocketPath=self.redisUnixSocketPath)
         
-        self.hostname = socket.gethostname()
+        # Redis Diameter queues, peer registry and Cx answer mailboxes must use
+        # the same namespace as DiameterService. A container hostname differs
+        # from the configured Diameter Origin-Host in Docker deployments.
+        # This is the *local HSS* namespace, not the destination S-CSCF.
+        self.hostname = str(originHost).strip()
+
 
         self.database = Database(logTool=logTool, main_service=main_service)
         from cx import CxService
