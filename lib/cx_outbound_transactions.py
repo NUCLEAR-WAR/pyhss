@@ -1,0 +1,48 @@
+"""Correlated Cx request/answer transport, without registration-state side effects.
+
+This polls the existing inbound diagnostic list. It MUST NOT be used as proof
+of subscriber deregistration until the peer's Result-Code is evaluated.
+"""
+import json
+import time
+from .cx_outbound_correlation import matches_answer, header
+
+
+def await_correlated_answer(diameter, operation, hostname, timeout=5.0, poll_interval=0.05, **kwargs):
+    """Queue an RTR/PPR and await its matching RTA/PPA; return structured status.
+
+    The inbound list is read-only; concurrent callers cannot steal each other's
+    answers. A matching answer is not necessarily a successful answer.
+    """
+    operation = operation.upper()
+    if operation not in ('RTR', 'PPR'):
+        raise ValueError('Only RTR and PPR are supported')
+    if timeout <= 0 or timeout > 60:
+        raise ValueError('Timeout must be within (0, 60] seconds')
+    peer = diameter.getPeerByHostname(hostname=hostname)
+    if peer is None or not getattr(peer, 'IpAddress', None) or not getattr(peer, 'Port', None):
+        return {'status': 'peer_unavailable', 'operation': operation}
+    request = diameter.sendDiameterRequest(requestType=operation, hostname=hostname, **kwargs)
+    if not request:
+        return {'status': 'queue_failed', 'operation': operation}
+    header(request)  # fail closed if the generated request is malformed
+    started = time.monotonic()
+    while time.monotonic() - started < timeout:
+        messages = diameter.redisMessaging.getList(
+            key='diameter-inbound', usePrefix=True,
+            prefixHostname=diameter.hostname, prefixServiceName='diameter') or []
+        for item in messages:
+            try:
+                entry = json.loads(item) if isinstance(item, str) else item
+                if entry.get('SenderIp') != peer.IpAddress or str(entry.get('SenderPort')) != str(peer.Port):
+                    continue
+                answer = entry.get('InboundHex')
+                if answer and matches_answer(request, answer, operation):
+                    return {'status': 'answer_received', 'operation': operation,
+                            'request': request, 'answer': answer,
+                            'elapsed_seconds': round(time.monotonic()-started, 3)}
+            except (ValueError, TypeError, KeyError):
+                continue
+        time.sleep(poll_interval)
+    return {'status': 'timeout', 'operation': operation,
+            'request': request, 'elapsed_seconds': round(time.monotonic()-started, 3)}
