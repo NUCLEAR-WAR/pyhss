@@ -5,7 +5,7 @@ of subscriber deregistration until the peer's Result-Code is evaluated.
 """
 import json
 import time
-from .cx_outbound_correlation import matches_answer, header
+from cx_outbound_correlation import matches_answer, header
 
 
 def await_correlated_answer(diameter, operation, hostname, timeout=5.0, poll_interval=0.05, **kwargs):
@@ -47,7 +47,7 @@ def await_correlated_answer(diameter, operation, hostname, timeout=5.0, poll_int
                     continue
                 answer = entry.get('InboundHex')
                 if answer and matches_answer(request, answer, operation):
-                    from .cx_outbound_results import evaluate_answer
+                    from cx_outbound_results import evaluate_answer
                     result = evaluate_answer(request, answer, operation)
                     return {'status': result['status'], 'operation': operation,
                             'result': result, 'request': request, 'answer': answer,

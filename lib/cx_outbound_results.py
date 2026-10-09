@@ -3,7 +3,7 @@
 This module never changes subscriber state. It requires a previously correlated
 answer and checks the mandatory Result-Code or Experimental-Result AVPs.
 """
-from .cx_outbound_correlation import matches_answer
+from cx_outbound_correlation import matches_answer
 
 
 def _avps(raw):
