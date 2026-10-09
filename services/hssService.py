@@ -95,6 +95,29 @@ class HssService:
 
                         try:
                             messageBinary = bytes.fromhex(buffered_diameter_message)
+                            # Route Cx server-initiated answers to a transaction-specific
+                            # Redis mailbox. Do not pass answers through request handlers.
+                            from cx_outbound_correlation import header as cx_header
+                            try:
+                                cxh = cx_header(buffered_diameter_message)
+                            except ValueError:
+                                cxh = None
+                            if (cxh and not cxh['request']
+                                    and cxh['application'] == 16777216
+                                    and cxh['command'] in (304, 305)):
+                                mailbox = ('cx-answer-%d-%s-%s' % (
+                                    cxh['command'], cxh['hop_by_hop'].hex(),
+                                    cxh['end_to_end'].hex()))
+                                self.redisMessaging.sendMessage(
+                                    queue=mailbox,
+                                    message=json.dumps({
+                                        'SenderIp': inboundData.SenderIp,
+                                        'SenderPort': inboundData.SenderPort,
+                                        'InboundHex': buffered_diameter_message}),
+                                    queueExpiry=90, usePrefix=True,
+                                    prefixHostname=self.hostname,
+                                    prefixServiceName='diameter')
+                                continue
                             diameterOutbound = self.diameterLibrary.generateDiameterResponse(binaryData=messageBinary)
 
                             if diameterOutbound == None:

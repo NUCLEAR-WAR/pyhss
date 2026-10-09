@@ -26,22 +26,33 @@ def await_correlated_answer(diameter, operation, hostname, timeout=5.0, poll_int
     if not request:
         return {'status': 'queue_failed', 'operation': operation}
     header(request)  # fail closed if the generated request is malformed
+    # Answers are dispatched by hssService into a per-transaction mailbox.
+    # Never read the shared inbound request queue (it is consumed by HSS).
+    req_header = header(request)
+    mailbox = 'cx-answer-%d-%s-%s' % (
+        req_header['command'], req_header['hop_by_hop'].hex(),
+        req_header['end_to_end'].hex())
     started = time.monotonic()
     while time.monotonic() - started < timeout:
         messages = diameter.redisMessaging.getList(
-            key='diameter-inbound', usePrefix=True,
-            prefixHostname=diameter.hostname, prefixServiceName='diameter') or []
+            key=mailbox, usePrefix=True, prefixHostname=diameter.hostname,
+            prefixServiceName='diameter') or []
         for item in messages:
             try:
+                if isinstance(item, bytes):
+                    item = item.decode('utf-8')
                 entry = json.loads(item) if isinstance(item, str) else item
-                if entry.get('SenderIp') != peer.IpAddress or str(entry.get('SenderPort')) != str(peer.Port):
+                if (entry.get('SenderIp') != peer.IpAddress
+                        or str(entry.get('SenderPort')) != str(peer.Port)):
                     continue
                 answer = entry.get('InboundHex')
                 if answer and matches_answer(request, answer, operation):
-                    return {'status': 'answer_received', 'operation': operation,
-                            'request': request, 'answer': answer,
+                    from .cx_outbound_results import evaluate_answer
+                    result = evaluate_answer(request, answer, operation)
+                    return {'status': result['status'], 'operation': operation,
+                            'result': result, 'request': request, 'answer': answer,
                             'elapsed_seconds': round(time.monotonic()-started, 3)}
-            except (ValueError, TypeError, KeyError):
+            except (ValueError, TypeError, KeyError, AttributeError):
                 continue
         time.sleep(poll_interval)
     return {'status': 'timeout', 'operation': operation,
