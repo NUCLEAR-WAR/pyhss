@@ -2384,48 +2384,6 @@ def _cx_json_safe(value):
     return value
 
 
-@ns_provisioning.route('/cx/<int:ims_subscriber_id>/operations/preview/')
-class ProvisionCxOperationsPreview(Resource):
-    @auth_required
-    def get(self, ims_subscriber_id):
-        """Read-only preflight for HSS-initiated RTR/PPR; never changes state."""
-        try:
-            repo = cxProvisioning.repo
-            with repo.engine.connect() as connection:
-                record = repo.record(ims_subscriber_id, connection)
-                definition = repo.definition(record, connection)
-                profile = {'record': record, 'definition': definition}
-                state = repo.state(profile, connection)
-                registered_groups = {
-                    key: {'registered_impis': list(group.get('registered', [])),
-                          'state': group.get('state')}
-                    for key, group in state['groups'].items()
-                    if group.get('registered')
-                }
-                xml = {}
-                for public in definition['public_identities']:
-                    if public['set_id'] not in xml:
-                        profile['public'] = public
-                        xml[public['set_id']] = repo.user_data(profile)
-                assigned = bool(state.get('scscf') and state.get('peer') and state.get('realm'))
-                return _cx_json_safe({
-                    'ims_subscriber_id': ims_subscriber_id,
-                    'scscf': state.get('scscf'),
-                    'peer': state.get('peer'),
-                    'realm': state.get('realm'),
-                    'registered_groups': registered_groups,
-                    'rtr': {'ready': assigned and bool(registered_groups),
-                            'reason': 'ready_for_diameter_transport' if assigned and registered_groups else 'no_active_assignment_or_peer',
-                            'note': 'RTR must wait for correlated RTA before any deletion.'},
-                    'ppr': {'ready': assigned and bool(registered_groups),
-                            'reason': 'ready_for_diameter_transport' if assigned and registered_groups else 'save_for_next_registration',
-                            'saa_xml_by_set': xml,
-                            'note': 'PPR must carry applicable User-Data and wait for correlated PPA.'},
-                    'operation_mode': 'preview_only',
-                }), 200
-        except Exception as error:
-            return handle_exception(error)
-
 @ns_provisioning.route('/cx/<int:ims_subscriber_id>/audit/')
 class ProvisionCxAudit(Resource):
     @auth_required
@@ -2504,6 +2462,57 @@ class ProvisionCxProfile(Resource):
                 clear_authentication_pending=False)
             return {'result':'OK','ims_subscriber_id':ims_subscriber_id,'definition':result},200
         except Exception as error:return handle_exception(error)
+
+
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/deregister/')
+class ProvisionCxDeregister(Resource):
+    @auth_required
+    def post(self, ims_subscriber_id):
+        """Send an RTR and report RTA. Never delete or locally clear registration."""
+        try:
+            body = request.get_json(silent=True) or {}
+            if not isinstance(body, dict) or body.get('confirm') != 'DEREGISTER':
+                return {'error': 'Explicit confirm=DEREGISTER required'}, 400
+            timeout = float(body.get('timeout_seconds', 10))
+            if not 1 <= timeout <= 60:
+                return {'error': 'timeout_seconds must be between 1 and 60'}, 400
+            repo = cxProvisioning.repo
+            with repo.engine.connect() as connection:
+                record = repo.record(ims_subscriber_id, connection)
+                definition = repo.definition(record, connection)
+                profile = {'record': record, 'definition': definition}
+                state = repo.state(profile, connection)
+            groups = state.get('groups') or {}
+            active = {name: group for name, group in groups.items()
+                      if group.get('registered')}
+            if not active:
+                return {'status': 'not_registered', 'ims_subscriber_id': ims_subscriber_id}, 409
+            peer = state.get('peer')
+            scscf = state.get('scscf')
+            realm = state.get('realm')
+            if not all((peer, scscf, realm)):
+                return {'status': 'missing_routing', 'ims_subscriber_id': ims_subscriber_id}, 409
+            from urllib.parse import urlsplit
+            destination_host = urlsplit(scscf.replace('sip:', 'sip://', 1)).hostname
+            if not destination_host:
+                return {'status': 'invalid_scscf', 'ims_subscriber_id': ims_subscriber_id}, 409
+            # Recheck the registration state immediately before queuing; the
+            # response does not itself authorize deletion or local state clearing.
+            from cx_outbound_transactions import await_correlated_answer
+            result = await_correlated_answer(
+                diameterClient, 'RTR', hostname=peer, timeout=timeout,
+                imsi=record['imsi'], domain=realm,
+                destinationHost=destination_host, destinationRealm=realm)
+            safe = {key: result.get(key) for key in
+                    ('status', 'operation', 'elapsed_seconds')}
+            safe['ims_subscriber_id'] = ims_subscriber_id
+            safe['active_registration_sets_before_request'] = sorted(active)
+            safe['result'] = result.get('result')
+            safe['note'] = ('No subscriber deletion or registration-state mutation performed. '
+                            'Verify S-CSCF deregistration and refreshed HSS state before deletion.')
+            return _cx_json_safe(safe), (200 if result.get('status') == 'success' else 502)
+        except Exception as error:
+            return handle_exception(error)
 
 @ns_provisioning.route('/subscriber/')
 class ProvisionSubscriberService(Resource):
