@@ -2490,16 +2490,23 @@ class ProvisionCxDeregister(Resource):
             groups = state.get('groups') or {}
             active = {name: group for name, group in groups.items()
                       if group.get('registered')}
-            if not active:
-                return {'status': 'not_registered', 'ims_subscriber_id': ims_subscriber_id}, 409
+            reason_code = body.get('reason_code', 0)
+            if type(reason_code) is not int or reason_code not in (0, 1, 2, 3):
+                return {'status': 'invalid_reason', 'allowed': [0, 1, 2, 3]}, 400
+            eligible = ({k:v for k,v in groups.items() if not v.get('registered')}
+                        if reason_code == 3 else active)
+            if not eligible:
+                return {'status': 'no_eligible_registration_set', 'ims_subscriber_id': ims_subscriber_id}, 409
             selected_set = body.get('registration_set')
             if selected_set is None:
-                if len(active) != 1:
-                    return {'status':'scope_required','active_registration_sets':sorted(active)},409
-                selected_set = next(iter(active))
-            if selected_set not in active:
-                return {'status':'invalid_scope','active_registration_sets':sorted(active)},409
-            registered_impis = list(active[selected_set].get('registered') or [])
+                if len(eligible) != 1:
+                    return {'status':'scope_required','eligible_registration_sets':sorted(eligible)},409
+                selected_set = next(iter(eligible))
+            if selected_set not in eligible:
+                return {'status':'invalid_scope','eligible_registration_sets':sorted(eligible)},409
+            registered_impis = list(eligible[selected_set].get('registered') or [])
+            if reason_code == 3 and not registered_impis:
+                registered_impis = list(definition.get('private_identities') or [])
             aliases = definition.get('digest_identity_aliases') or {}
             canonical = list(dict.fromkeys(aliases.get(x,x) for x in registered_impis))
             selected_impi = body.get('private_identity')
@@ -2509,9 +2516,9 @@ class ProvisionCxDeregister(Resource):
                 selected_impi = canonical[0]
             if aliases.get(selected_impi,selected_impi) not in canonical:
                 return {'status':'private_identity_not_registered'},409
-            reason_code = body.get('reason_code',0)
-            if reason_code != 0:
-                return {'status':'unsupported_reason','message':'Only permanent termination (0) is supported in this operation'},400
+            reason_info = body.get('reason_info')
+            if reason_info is not None and (not isinstance(reason_info, str) or len(reason_info.encode('utf-8')) > 512):
+                return {'status':'invalid_reason_info'},400
             peer = state.get('peer')
             scscf = state.get('scscf')
             realm = state.get('realm')
@@ -2530,7 +2537,7 @@ class ProvisionCxDeregister(Resource):
             result = await_correlated_answer(
                 diameterClient, 'RTR', hostname=destination_host, peer_hint=peer, timeout=timeout,
                 imsi=record['imsi'], domain=realm, registration_sets=[selected_set],
-                private_identity=selected_impi, reason_code=reason_code,
+                private_identity=selected_impi, reason_code=reason_code, reason_info=reason_info,
                 destinationHost=destination_host, destinationRealm=realm)
             current_app.logger.warning(
                 '[CxRTR] request_id=%s status=%s diagnostics=%s',
@@ -2542,6 +2549,8 @@ class ProvisionCxDeregister(Resource):
             safe['registration_set'] = selected_set
             safe['private_identity'] = selected_impi
             safe['reason_code'] = reason_code
+            safe['destination_host'] = destination_host
+            safe['reason_info'] = reason_info
             safe['active_registration_sets_before_request'] = sorted(active)
             safe['result'] = result.get('result')
             safe['note'] = ('No subscriber deletion or registration-state mutation performed. '

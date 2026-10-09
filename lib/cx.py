@@ -314,7 +314,7 @@ class CxService:
             return 2003,self.capabilities(),True
         raise CxError(5003,reason='terminating_unregistered_service_not_available')
 
-    def rtr(self, imsi, destination_host, destination_realm, registration_sets=None, private_identity=None, reason_code=0):
+    def rtr(self, imsi, destination_host, destination_realm, registration_sets=None, private_identity=None, reason_code=0, reason_info=None):
         """Build a Cx RTR for active implicit registration sets.
 
         Public-Identity AVP 601 is mandatory for our Kamailio S-CSCF. Only
@@ -330,23 +330,29 @@ class CxService:
             record = dict(records[0])
             definition = self.repo.definition(record, connection)
             state = self.repo.state({'record': record, 'definition': definition}, connection)
-            active = {name: group for name, group in (state.get('groups') or {}).items()
-                      if group.get('registered')}
-            selected = list(registration_sets) if registration_sets is not None else list(active)
-            if not selected or any(name not in active for name in selected):
-                raise ValueError('RTR requires explicitly registered IRS groups')
+            groups = state.get('groups') or {}
+            active = {name: group for name, group in groups.items() if group.get('registered')}
+            eligible = ({name: group for name, group in groups.items() if not group.get('registered')}
+                        if reason_code == 3 else active)
+            selected = list(registration_sets) if registration_sets is not None else list(eligible)
+            if not selected or any(name not in eligible for name in selected):
+                raise ValueError('RTR requires IRS groups eligible for the selected reason')
             public = []
             for identity in definition['public_identities']:
                 if identity['set_id'] in selected and identity['identity'] not in public:
                     public.append(identity['identity'])
             if not public:
                 raise ValueError('RTR has no provisioned public identities in active IRS')
-            if reason_code != 0:
-                raise ValueError('Only permanent termination (reason 0) is enabled for this administrative operation')
+            if type(reason_code) is not int or reason_code not in (0, 1, 2, 3):
+                raise ValueError('RTR reason_code must be 0, 1, 2 or 3')
+            if reason_code == 3 and any(name in active for name in selected):
+                raise ValueError('REMOVE_S-CSCF cannot target registered IRS')
             aliases = definition.get('digest_identity_aliases', {})
             registered = set()
             for name in selected:
-                registered.update(aliases.get(x, x) for x in active[name].get('registered', []))
+                registered.update(aliases.get(x, x) for x in eligible[name].get('registered', []))
+            if not registered and reason_code == 3:
+                registered = set(definition['private_identities'])
             if not registered:
                 raise ValueError('RTR has no registered private identity')
             if not private_identity:
@@ -375,8 +381,15 @@ class CxService:
         payload += self.avp(277, 1, integer=True)
         payload += self.avp(293, destination_host) + self.avp(283, destination_realm)
         payload += self.avp(1, target)
-        payload += self.grouped(615, self.avp(616, reason_code, VENDOR, True)
-                                + self.avp(617, 'Administrative de-registration', VENDOR))
+        reason_labels = {0: 'Permanent termination', 1: 'New S-CSCF assigned',
+                         2: 'S-CSCF change', 3: 'Remove S-CSCF assignment'}
+        info = reason_labels[reason_code] if reason_info is None else reason_info
+        if not isinstance(info, str) or len(info.encode('utf-8')) > 512:
+            raise ValueError('reason_info must be UTF-8 text up to 512 bytes')
+        reason_avps = self.avp(616, reason_code, VENDOR, True)
+        if info:
+            reason_avps += self.avp(617, info, VENDOR)
+        payload += self.grouped(615, reason_avps)
         for impu in public:
             payload += self.avp(601, impu, VENDOR)
         return self.d.generate_diameter_packet('01', 'c0', 304, CX_APP,
