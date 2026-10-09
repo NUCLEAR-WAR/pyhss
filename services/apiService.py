@@ -2478,6 +2478,15 @@ class ProvisionCxDeregister(Resource):
             body = request.get_json(silent=True) or {}
             if not isinstance(body, dict) or body.get('confirm') != 'DEREGISTER':
                 return {'error': 'Explicit confirm=DEREGISTER required'}, 400
+            # RTR is independent of persistent registration and call barring.
+            # Reject unsupported policy changes rather than silently claiming success.
+            for policy_key in ('block_registration', 'bar_calls'):
+                if type(body.get(policy_key, False)) is not bool:
+                    return {'status':'invalid_policy_option','option':policy_key},400
+            if body.get('block_registration') or body.get('bar_calls'):
+                return {'status':'policy_not_implemented',
+                        'message':'RTR cannot enable registration/calling barring: persistent Cx authorization and iFC/TAS enforcement must be installed separately. No RTR sent.',
+                        'unsupported_options':[k for k in ('block_registration','bar_calls') if body.get(k)]},501
             timeout = float(body.get('timeout_seconds', 10))
             if not 1 <= timeout <= 60:
                 return {'error': 'timeout_seconds must be between 1 and 60'}, 400
@@ -2493,6 +2502,9 @@ class ProvisionCxDeregister(Resource):
             reason_code = body.get('reason_code', 0)
             if type(reason_code) is not int or reason_code not in (0, 1, 2, 3):
                 return {'status': 'invalid_reason', 'allowed': [0, 1, 2, 3]}, 400
+            if reason_code == 1:
+                return {'status':'reassignment_required',
+                        'message':'NEW_SERVER_ASSIGNED requires a verified new S-CSCF assignment; this API does not perform reassignment or state transition. No RTR sent.'},409
             eligible = ({k:v for k,v in groups.items() if not v.get('registered')}
                         if reason_code == 3 else active)
             if not eligible:
