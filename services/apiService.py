@@ -7,9 +7,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import sys
 import json
+import logging
+import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from flask import Flask, request, jsonify, Response, redirect
+from flask import Flask, request, jsonify, Response, redirect, current_app
 from flask_restx import Api, Resource, fields, reqparse, abort
 from werkzeug.middleware.proxy_fix import ProxyFix
 from functools import wraps
@@ -2469,6 +2471,9 @@ class ProvisionCxDeregister(Resource):
     @auth_required
     def post(self, ims_subscriber_id):
         """Send an RTR and report RTA. Never delete or locally clear registration."""
+        request_id = uuid.uuid4().hex
+        current_app.logger.warning('[CxRTR] request_id=%s subscriber=%s request_started',
+                                   request_id, ims_subscriber_id)
         try:
             body = request.get_json(silent=True) or {}
             if not isinstance(body, dict) or body.get('confirm') != 'DEREGISTER':
@@ -2499,12 +2504,19 @@ class ProvisionCxDeregister(Resource):
             # Recheck the registration state immediately before queuing; the
             # response does not itself authorize deletion or local state clearing.
             from cx_outbound_transactions import await_correlated_answer
+            current_app.logger.warning(
+                '[CxRTR] request_id=%s subscriber=%s scscf=%s destination_host=%s peer_hint=%s realm=%s',
+                request_id, ims_subscriber_id, scscf, destination_host, peer, realm)
             result = await_correlated_answer(
                 diameterClient, 'RTR', hostname=destination_host, peer_hint=peer, timeout=timeout,
                 imsi=record['imsi'], domain=realm,
                 destinationHost=destination_host, destinationRealm=realm)
+            current_app.logger.warning(
+                '[CxRTR] request_id=%s status=%s diagnostics=%s',
+                request_id, result.get('status'), result.get('diagnostics'))
             safe = {key: result.get(key) for key in
-                    ('status', 'operation', 'elapsed_seconds')}
+                    ('status', 'operation', 'elapsed_seconds', 'diagnostics')}
+            safe['request_id'] = request_id
             safe['ims_subscriber_id'] = ims_subscriber_id
             safe['active_registration_sets_before_request'] = sorted(active)
             safe['result'] = result.get('result')
@@ -2512,6 +2524,7 @@ class ProvisionCxDeregister(Resource):
                             'Verify S-CSCF deregistration and refreshed HSS state before deletion.')
             return _cx_json_safe(safe), (200 if result.get('status') == 'success' else 502)
         except Exception as error:
+            current_app.logger.exception('[CxRTR] request_id=%s unexpected_failure', request_id)
             return handle_exception(error)
 
 @ns_provisioning.route('/subscriber/')

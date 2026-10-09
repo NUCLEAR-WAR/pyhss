@@ -33,7 +33,7 @@ def await_correlated_answer(diameter, operation, hostname, timeout=5.0, poll_int
     if resolved['status'] != 'resolved':
         debug('Peer resolution failed: %s' % resolved['status'], 'warning')
         return {'status': resolved['status'], 'operation': operation,
-                'peer_resolution': resolved.get('diagnostics')}
+                'diagnostics': resolved.get('diagnostics')}
     peer = resolved['peer']
     hostname = resolved['hostname']
     debug('Selected Diameter Origin-Host=%s endpoint=%s:%s' %
