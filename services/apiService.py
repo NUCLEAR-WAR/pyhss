@@ -2489,6 +2489,47 @@ class ProvisionCxLiveIfc(Resource):
             current_app.logger.exception('[CxLiveIFC] save failed')
             return {'status':'internal_error'},500
 
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/ppr-history/')
+class ProvisionCxPprHistory(Resource):
+    @auth_required
+    def get(self,ims_subscriber_id):
+        try:
+            set_id=request.args.get('registration_set')
+            return _cx_json_safe({'history':cxProvisioning.repo.ppr_history(ims_subscriber_id,set_id)}),200
+        except Exception:
+            current_app.logger.exception('[CxPPR] history failed')
+            return {'status':'internal_error'},500
+
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/save-and-push/')
+class ProvisionCxSaveAndPush(Resource):
+    @auth_required
+    def post(self,ims_subscriber_id):
+        """Save and push are separate outcomes. Never roll back a committed iFC on PPA failure."""
+        body=request.get_json(force=True)
+        if not isinstance(body,dict) or body.get('confirm')!='SAVE_AND_PUSH':
+            return {'status':'confirmation_required'},400
+        set_id=body.get('registration_set');impi=body.get('private_identity')
+        if type(body.get('expected_version')) is not int or not set_id or not impi:
+            return {'status':'invalid_request'},400
+        try:
+            saved=cxProvisioning.repo.live_ifc_save(ims_subscriber_id,set_id,body.get('ifc_xml'),body['expected_version'])
+        except ValueError as error:return {'status':'save_failed','reason':str(error)},409
+        except Exception:
+            current_app.logger.exception('[CxPPR] save_and_push save failed')
+            return {'status':'save_failed'},500
+        # Dispatch via same Flask handler, preserving authentication context.
+        push_body={'confirm':'PUSH_PROFILE','registration_set':set_id,'private_identity':impi,
+                   'timeout_seconds':body.get('timeout_seconds',10),'expected_version':saved['version']}
+        try:
+            from flask import current_app as flask_app
+            with flask_app.test_request_context(json=push_body,headers={k:v for k,v in request.headers.items() if k.lower() in ('authorization','provisioning-key')}):
+                outcome,http=ProvisionCxPushProfile().post(ims_subscriber_id)
+            return _cx_json_safe({'saved':saved,'push':outcome,'push_http_status':http,
+                                  'status':'success' if http==200 else 'saved_push_failed'}), (200 if http==200 else 207)
+        except Exception:
+            current_app.logger.exception('[CxPPR] save committed but push failed')
+            return {'status':'saved_push_failed','saved':saved,'push':{'status':'internal_error'}},207
+
 @ns_provisioning.route('/cx/<int:ims_subscriber_id>/push-profile/')
 class ProvisionCxPushProfile(Resource):
     @auth_required
@@ -2527,20 +2568,31 @@ class ProvisionCxPushProfile(Resource):
             hostname = urlsplit(scscf.replace('sip:', 'sip://', 1)).hostname
             if not hostname:
                 return {'status': 'invalid_scscf'}, 409
-            current_app.logger.warning('[CxPPR] id=%s subscriber=%s set=%s destination=%s started',
-                                       operation_id, ims_subscriber_id, selected_set, hostname)
+            expected_version=body.get('expected_version')
+            if expected_version is not None and type(expected_version) is not int:
+                return {'status':'invalid_version'},400
+            try:
+                audit=repo.ppr_begin(ims_subscriber_id,selected_set,selected_impi,scscf,expected_version)
+            except ValueError as error:
+                return {'status':'conflict','reason':str(error)},409
+            operation_id=audit['operation_id']
+            current_app.logger.warning('[CxPPR] id=%s subscriber=%s set=%s version=%s destination=%s started',
+                                       operation_id, ims_subscriber_id, selected_set,audit['version'],hostname)
             from cx_outbound_transactions import await_correlated_answer
             result = await_correlated_answer(
                 diameterClient, 'PPR', hostname=hostname, peer_hint=peer, timeout=timeout,
                 ims_subscriber_id=ims_subscriber_id, registration_set=selected_set,
                 private_identity=selected_impi, destinationHost=hostname, destinationRealm=realm)
             current_app.logger.warning('[CxPPR] id=%s status=%s', operation_id, result.get('status'))
+            tracking=repo.ppr_finish(operation_id,result.get('status') or 'unknown',result)
             return _cx_json_safe({
                 'status': result.get('status'), 'operation': 'PPR', 'operation_id': operation_id,
                 'ims_subscriber_id': ims_subscriber_id, 'registration_set': selected_set,
                 'private_identity': selected_impi, 'destination_host': hostname,
                 'elapsed_seconds': result.get('elapsed_seconds'),
                 'ppa_confirmed': result.get('status') == 'success',
+                'profile_version':audit['version'], 'profile_sha256':audit['sha256'],
+                'version_tracking':tracking,
                 'result': result.get('result'), 'diagnostics': result.get('diagnostics'),
                 'note': 'Saved subscription was pushed; PPA does not independently verify TAS/iFC runtime behavior.'
             }), (200 if result.get('status') == 'success' else 502)
