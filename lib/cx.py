@@ -125,6 +125,7 @@ class CxService:
         if registration and (not sub or not sub.get('enabled',True)):raise CxError(5003,False)
         public=profile['public'];definition=profile['definition']
         if registration and not public.get('can_register',True):raise CxError(5003,False)
+        if registration and self.repo.registration_blocked(profile):raise CxError(5003,False,reason='administratively_blocked_registration')
         if public['barred'] and not any(not p['barred'] for p in definition['public_identities'] if p['set_id']==public['set_id']):raise CxError(5003,False)
         if visited is not None:
             allowed=definition.get('visited_networks') or self.settings.get('visited_networks') or [definition['digest_realm']]
@@ -238,6 +239,8 @@ class CxService:
                 _,definition=self.repo.find(private,'private',c)
             publics=[p['identity'] for p in definition['public_identities'] if private_key(private) in p['private_identities']]
         profiles=[self.repo.resolve(p,private) for p in publics]
+        if typ in (1,2) and any(self.repo.registration_blocked(p) for p in profiles):
+            raise CxError(5003,False,reason='administratively_blocked_registration')
         if private and any(private_key(private) in p['definition'].get('digest_identity_aliases',{}) for p in profiles):
             # MAA identifies the real authentication IMPI. A bootstrap lookup
             # name must not become a successful registration's private identity.

@@ -2600,6 +2600,29 @@ class ProvisionCxPushProfile(Resource):
             current_app.logger.exception('[CxPPR] id=%s unexpected_failure', operation_id)
             return {'status': 'internal_error', 'operation_id': operation_id}, 500
 
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/registration-policy/')
+class ProvisionCxRegistrationPolicy(Resource):
+    @auth_required
+    def get(self,ims_subscriber_id):
+        try:return _cx_json_safe({'policies':cxProvisioning.repo.registration_policies(ims_subscriber_id)}),200
+        except Exception as error:return handle_exception(error)
+
+    @auth_required
+    def put(self,ims_subscriber_id):
+        try:
+            body=request.get_json(silent=True) or {}
+            if body.get('confirm')!='UPDATE_REGISTRATION_POLICY':return {'status':'confirmation_required'},400
+            if type(body.get('blocked')) is not bool:return {'status':'invalid_blocked'},400
+            if not body.get('registration_set') or not body.get('private_identity'):return {'status':'scope_required'},400
+            result=cxProvisioning.repo.registration_policy_update(
+                ims_subscriber_id,body['registration_set'],body['private_identity'],body['blocked'])
+            current_app.logger.warning('[CxPolicy] subscriber=%s IRS=%s IMPI=%s blocked=%s',
+                ims_subscriber_id,body['registration_set'],body['private_identity'],body['blocked'])
+            return _cx_json_safe({'status':'saved','registration_policy':result,
+                'note':'Enforced on subsequent Cx registration authorization; does not terminate existing SIP contacts.'}),200
+        except ValueError as error:return {'status':'invalid_policy','message':str(error)},409
+        except Exception as error:return handle_exception(error)
+
 @ns_provisioning.route('/cx/<int:ims_subscriber_id>/deregister/')
 class ProvisionCxDeregister(Resource):
     @auth_required
