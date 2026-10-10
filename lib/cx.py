@@ -332,7 +332,7 @@ class CxService:
             state = self.repo.state({'record': record, 'definition': definition}, connection)
             groups = state.get('groups') or {}
             active = {name: group for name, group in groups.items() if group.get('registered')}
-            eligible = ({name: group for name, group in groups.items() if not group.get('registered')}
+            eligible = ({name: group for name, group in groups.items() if group.get('state') == 'unregistered' and not group.get('registered')}
                         if reason_code == 3 else active)
             selected = list(registration_sets) if registration_sets is not None else list(eligible)
             if not selected or any(name not in eligible for name in selected):
@@ -348,23 +348,26 @@ class CxService:
             if reason_code == 3 and any(name in active for name in selected):
                 raise ValueError('REMOVE_S-CSCF cannot target registered IRS')
             aliases = definition.get('digest_identity_aliases', {})
+            associated = set()
+            for identity in definition['public_identities']:
+                if identity['set_id'] in selected:
+                    associated.update(aliases.get(i, i) for i in
+                                      identity.get('private_identities', definition['private_identities']))
             registered = set()
             for name in selected:
                 registered.update(aliases.get(x, x) for x in eligible[name].get('registered', []))
-            if not registered and reason_code == 3:
-                registered = set(definition['private_identities'])
-            if not registered:
-                raise ValueError('RTR has no registered private identity')
+            candidates = associated if reason_code == 3 else registered
+            candidates &= set(definition['private_identities'])
+            if not candidates:
+                raise ValueError('RTR has no eligible associated private identity')
             if not private_identity:
-                if len(registered) != 1:
-                    raise ValueError('Multiple registered IMPIs: specify private_identity for scoped RTR')
-                target = next(iter(registered))
+                if len(candidates) != 1:
+                    raise ValueError('Multiple eligible IMPIs: specify private_identity')
+                target = next(iter(candidates))
             else:
                 target = aliases.get(private_identity, private_identity)
-                if target not in registered:
-                    raise ValueError('Requested IMPI is not registered in the selected IRS')
-            if target not in definition['private_identities']:
-                raise ValueError('Registered IMPI is not provisioned in this Cx profile')
+                if target not in candidates:
+                    raise ValueError('Requested IMPI is not eligible for selected IRS')
             # Do not include an IMPU which is not authorized for the selected IMPI.
             public = [x['identity'] for x in definition['public_identities']
                       if x['set_id'] in selected and target in

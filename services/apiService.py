@@ -2502,13 +2502,21 @@ class ProvisionCxDeregister(Resource):
             reason_code = body.get('reason_code', 0)
             if type(reason_code) is not int or reason_code not in (0, 1, 2, 3):
                 return {'status': 'invalid_reason', 'allowed': [0, 1, 2, 3]}, 400
-            if reason_code == 1:
-                return {'status':'reassignment_required',
-                        'message':'NEW_SERVER_ASSIGNED requires a verified new S-CSCF assignment; this API does not perform reassignment or state transition. No RTR sent.'},409
-            eligible = ({k:v for k,v in groups.items() if not v.get('registered')}
+            # Reason 3 removes a retained S-CSCF assignment for an unregistered
+            # IRS. It must not be used as a substitute for reason 0/2.
+            eligible = ({k: v for k, v in groups.items()
+                         if v.get('state') == 'unregistered' and not v.get('registered')}
                         if reason_code == 3 else active)
             if not eligible:
-                return {'status': 'no_eligible_registration_set', 'ims_subscriber_id': ims_subscriber_id}, 409
+                return {'status': 'no_eligible_registration_set',
+                        'ims_subscriber_id': ims_subscriber_id,
+                        'reason_code': reason_code,
+                        'available_sets': {k: {'state': v.get('state'),
+                                               'registered_impis': len(v.get('registered') or [])}
+                                           for k, v in groups.items()},
+                        'message': ('REMOVE_S-CSCF requires an unregistered IRS with a retained '
+                                    'S-CSCF assignment. For an active IRS use reason 0 or 2.')
+                                   if reason_code == 3 else 'No registered IRS eligible for RTR'}, 409
             selected_set = body.get('registration_set')
             if selected_set is None:
                 if len(eligible) != 1:
@@ -2516,18 +2524,46 @@ class ProvisionCxDeregister(Resource):
                 selected_set = next(iter(eligible))
             if selected_set not in eligible:
                 return {'status':'invalid_scope','eligible_registration_sets':sorted(eligible)},409
-            registered_impis = list(eligible[selected_set].get('registered') or [])
-            if reason_code == 3 and not registered_impis:
-                registered_impis = list(definition.get('private_identities') or [])
             aliases = definition.get('digest_identity_aliases') or {}
-            canonical = list(dict.fromkeys(aliases.get(x,x) for x in registered_impis))
+            provisioned_impis = list(definition.get('private_identities') or [])
+            # Scope IMPI choices to identities associated with this IRS.
+            associated = set()
+            for public in definition.get('public_identities') or []:
+                if public.get('set_id') == selected_set:
+                    associated.update(aliases.get(i, i) for i in
+                                      public.get('private_identities', provisioned_impis))
+            registered_impis = [aliases.get(x, x) for x in
+                                (eligible[selected_set].get('registered') or [])]
+            candidates = sorted(set(registered_impis if reason_code != 3 else associated)
+                                & set(provisioned_impis))
             selected_impi = body.get('private_identity')
             if not selected_impi:
-                if len(canonical) != 1:
-                    return {'status':'private_identity_required','registered_private_identities':canonical},409
-                selected_impi = canonical[0]
-            if aliases.get(selected_impi,selected_impi) not in canonical:
-                return {'status':'private_identity_not_registered'},409
+                if len(candidates) != 1:
+                    return {'status': 'private_identity_required',
+                            'eligible_private_identities': candidates}, 409
+                selected_impi = candidates[0]
+            selected_impi = aliases.get(selected_impi, selected_impi)
+            if selected_impi not in candidates:
+                return {'status': 'invalid_private_identity',
+                        'eligible_private_identities': candidates}, 409
+            # Reason 1 describes a new S-CSCF already assigned through a
+            # separate, completed Cx procedure. Do not fabricate that assignment.
+            new_scscf = body.get('new_scscf')
+            if reason_code == 1:
+                if not isinstance(new_scscf, str) or not new_scscf.strip():
+                    return {'status': 'new_scscf_required'}, 400
+                from urllib.parse import urlsplit
+                new_host = urlsplit(new_scscf.replace('sip:', 'sip://', 1)).hostname
+                if not new_host or new_host.lower() == str(state.get('scscf', '')).removeprefix('sip:').lower():
+                    return {'status': 'invalid_new_scscf'}, 400
+                # The new server is a planned/verified assignment, not the RTR
+                # destination. Only the old assigned server receives the RTR.
+                if body.get('assignment_confirmed') is not True:
+                    return {'status': 'assignment_confirmation_required',
+                            'message': 'Complete and verify new S-CSCF assignment before RTR; '
+                                       'this endpoint does not create an assignment.'}, 409
+            elif new_scscf:
+                return {'status': 'new_scscf_only_for_reason_1'}, 400
             reason_info = body.get('reason_info')
             if reason_info is not None and (not isinstance(reason_info, str) or len(reason_info.encode('utf-8')) > 512):
                 return {'status':'invalid_reason_info'},400
@@ -2561,6 +2597,9 @@ class ProvisionCxDeregister(Resource):
             safe['registration_set'] = selected_set
             safe['private_identity'] = selected_impi
             safe['reason_code'] = reason_code
+            if reason_code == 1:
+                safe['new_scscf'] = new_scscf
+                safe['assignment_confirmed_by_operator'] = True
             safe['destination_host'] = destination_host
             safe['reason_info'] = reason_info
             safe['active_registration_sets_before_request'] = sorted(active)
