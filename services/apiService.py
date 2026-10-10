@@ -2466,6 +2466,65 @@ class ProvisionCxProfile(Resource):
         except Exception as error:return handle_exception(error)
 
 
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/push-profile/')
+class ProvisionCxPushProfile(Resource):
+    @auth_required
+    def post(self, ims_subscriber_id):
+        """Push saved profile to the assigned S-CSCF; do not mutate Cx state."""
+        operation_id = uuid.uuid4().hex
+        try:
+            body = request.get_json(force=True)
+            if not isinstance(body, dict) or body.get('confirm') != 'PUSH_PROFILE':
+                return {'status': 'confirmation_required'}, 400
+            timeout = float(body.get('timeout_seconds', 10))
+            if not 1 <= timeout <= 60:
+                return {'status': 'invalid_timeout'}, 400
+            repo = cxProvisioning.repo
+            with repo.engine.connect() as connection:
+                record = repo.record(ims_subscriber_id, connection)
+                definition = repo.definition(record, connection)
+                state = repo.state({'record': record, 'definition': definition}, connection)
+                # Prevent pushing unsaved/legacy-derived subscriptions as if explicitly edited.
+                if not connection.execute(sqlalchemy.select(repo.profiles.c.ims_subscriber_id).where(
+                        repo.profiles.c.ims_subscriber_id == ims_subscriber_id)).first():
+                    return {'status': 'explicit_profile_required'}, 409
+            groups = state.get('groups') or {}
+            eligible = {k: v for k, v in groups.items() if v.get('registered')}
+            selected_set = body.get('registration_set')
+            if selected_set not in eligible:
+                return {'status': 'invalid_registration_set', 'eligible_sets': sorted(eligible)}, 409
+            selected_impi = body.get('private_identity')
+            if selected_impi not in (eligible[selected_set].get('registered') or []):
+                return {'status': 'invalid_private_identity',
+                        'eligible_impis': eligible[selected_set].get('registered') or []}, 409
+            scscf, realm, peer = state.get('scscf'), state.get('realm'), state.get('peer')
+            if not all((scscf, realm, peer)):
+                return {'status': 'missing_routing'}, 409
+            from urllib.parse import urlsplit
+            hostname = urlsplit(scscf.replace('sip:', 'sip://', 1)).hostname
+            if not hostname:
+                return {'status': 'invalid_scscf'}, 409
+            current_app.logger.warning('[CxPPR] id=%s subscriber=%s set=%s destination=%s started',
+                                       operation_id, ims_subscriber_id, selected_set, hostname)
+            from cx_outbound_transactions import await_correlated_answer
+            result = await_correlated_answer(
+                diameterClient, 'PPR', hostname=hostname, peer_hint=peer, timeout=timeout,
+                ims_subscriber_id=ims_subscriber_id, registration_set=selected_set,
+                private_identity=selected_impi, destinationHost=hostname, destinationRealm=realm)
+            current_app.logger.warning('[CxPPR] id=%s status=%s', operation_id, result.get('status'))
+            return _cx_json_safe({
+                'status': result.get('status'), 'operation': 'PPR', 'operation_id': operation_id,
+                'ims_subscriber_id': ims_subscriber_id, 'registration_set': selected_set,
+                'private_identity': selected_impi, 'destination_host': hostname,
+                'elapsed_seconds': result.get('elapsed_seconds'),
+                'ppa_confirmed': result.get('status') == 'success',
+                'result': result.get('result'), 'diagnostics': result.get('diagnostics'),
+                'note': 'Saved subscription was pushed; PPA does not independently verify TAS/iFC runtime behavior.'
+            }), (200 if result.get('status') == 'success' else 502)
+        except Exception:
+            current_app.logger.exception('[CxPPR] id=%s unexpected_failure', operation_id)
+            return {'status': 'internal_error', 'operation_id': operation_id}, 500
+
 @ns_provisioning.route('/cx/<int:ims_subscriber_id>/deregister/')
 class ProvisionCxDeregister(Resource):
     @auth_required

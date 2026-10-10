@@ -314,6 +314,37 @@ class CxService:
             return 2003,self.capabilities(),True
         raise CxError(5003,reason='terminating_unregistered_service_not_available')
 
+    def ppr(self, ims_subscriber_id, destination_host, destination_realm, registration_set, private_identity):
+        """Build Cx PPR (305) from saved IMS subscription; never synthesize IMPUs."""
+        with self.repo.engine.connect() as connection:
+            record = self.repo.record(ims_subscriber_id, connection)
+            definition = self.repo.definition(record, connection)
+            profile = {'record': record, 'definition': definition}
+            state = self.repo.state(profile, connection)
+            group = (state.get('groups') or {}).get(registration_set)
+            if not group or private_identity not in (group.get('registered') or []):
+                raise ValueError('Selected IMPI is not registered in the requested IRS')
+            aliases = definition.get('digest_identity_aliases') or {}
+            associated = [p for p in definition['public_identities']
+                          if p['set_id'] == registration_set and private_identity in
+                          [aliases.get(i, i) for i in p.get('private_identities', definition['private_identities'])]]
+            if not associated:
+                raise ValueError('IMPI is not associated with any IMPU in selected IRS')
+            profile['public'] = associated[0]
+            xml = self.repo.user_data(profile, private=private_identity)
+        import uuid
+        sid = bytes.fromhex(self.d.OriginHost).decode() + ';cx-ppr;' + uuid.uuid4().hex
+        payload = self.avp(263, sid)
+        payload += self.grouped(260, self.avp(266, VENDOR, integer=True) + self.avp(258, CX_APP, integer=True), vendor=0)
+        payload += self.avp(277, 1, integer=True)
+        payload += self.d.generate_avp(264, '40', self.d.OriginHost)
+        payload += self.d.generate_avp(296, '40', self.d.OriginRealm)
+        payload += self.avp(293, destination_host) + self.avp(283, destination_realm)
+        payload += self.avp(1, private_identity)
+        payload += self.avp(606, xml, VENDOR)
+        return self.d.generate_diameter_packet('01', 'c0', 305, CX_APP,
+                                               self.d.generate_id(4), self.d.generate_id(4), payload)
+
     def rtr(self, imsi, destination_host, destination_realm, registration_sets=None, private_identity=None, reason_code=0, reason_info=None):
         """Build a Cx RTR for active implicit registration sets.
 

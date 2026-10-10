@@ -127,6 +127,7 @@ class Diameter:
 
         self.diameterRequestList = [
                 # Gx PCEF/PCRF
+                {"commandCode": 305, "applicationId": 16777216, "requestMethod": self.Request_16777216_305, "failureResultCode": 5012, "requestAcronym": "PPR", "responseAcronym": "PPA", "requestName": "Push Profile Request", "responseName": "Push Profile Answer"},
                 {"commandCode": 304, "applicationId": 16777216, "requestMethod": self.Request_16777216_304, "failureResultCode": 5012 ,"requestAcronym": "RTR", "responseAcronym": "RTA", "requestName": "Registration Termination Request", "responseName": "Registration Termination Answer"},
 
                 # Re OCS
@@ -4461,6 +4462,12 @@ class Diameter:
         avp += self.generate_vendor_avp(602, "c0", 10415, self.ProductName)                         #Server-Name
         response = self.generate_diameter_packet("01", "c0", 303, 16777216, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
         return response
+
+    # 3GPP Cx Push Profile Request (PPR)
+    def Request_16777216_305(self, ims_subscriber_id, destinationHost, destinationRealm,
+                              registration_set, private_identity):
+        return self.cx.ppr(ims_subscriber_id, destinationHost, destinationRealm,
+                           registration_set, private_identity)
 
     #3GPP Cx Registration Termination Request (RTR)
     def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm, registration_sets=None, private_identity=None, reason_code=0, reason_info=None):
