@@ -2582,6 +2582,7 @@ class ProvisionCxDeregister(Resource):
             current_app.logger.warning(
                 '[CxRTR] request_id=%s subscriber=%s scscf=%s destination_host=%s peer_hint=%s realm=%s',
                 request_id, ims_subscriber_id, scscf, destination_host, peer, realm)
+            expected_rtr_state = __import__('copy').deepcopy(state)
             result = await_correlated_answer(
                 diameterClient, 'RTR', hostname=destination_host, peer_hint=peer, timeout=timeout,
                 imsi=record['imsi'], domain=realm, registration_sets=[selected_set],
@@ -2604,8 +2605,31 @@ class ProvisionCxDeregister(Resource):
             safe['reason_info'] = reason_info
             safe['active_registration_sets_before_request'] = sorted(active)
             safe['result'] = result.get('result')
-            safe['note'] = ('No subscriber deletion or registration-state mutation performed. '
-                            'Verify S-CSCF deregistration and refreshed HSS state before deletion.')
+            safe['rta_confirmed'] = result.get('status') == 'success'
+            safe['subscriber_deleted'] = False
+            safe['registration_blocked'] = False
+            safe['calling_barred'] = False
+            if safe['rta_confirmed']:
+                from cx_rtr_reconcile import reconcile_rtr
+                try:
+                    reconciliation = reconcile_rtr(
+                        repo, ims_subscriber_id, selected_set, selected_impi,
+                        reason_code, expected_rtr_state)
+                    safe.update(reconciliation)
+                    current_app.logger.warning(
+                        '[CxRTR] request_id=%s reconciliation=%s',
+                        request_id, reconciliation.get('reconciliation_status'))
+                except Exception:
+                    current_app.logger.exception(
+                        '[CxRTR] request_id=%s state_reconciliation_failed', request_id)
+                    safe['hss_state_reconciled'] = False
+                    safe['reconciliation_status'] = 'error'
+            else:
+                safe['hss_state_reconciled'] = False
+                safe['reconciliation_status'] = 'rta_not_confirmed'
+            safe['note'] = ('RTA result and HSS reconciliation are reported separately. '
+                            'SIP Contact removal is not independently verified. '
+                            'No subscriber deletion or policy barring performed.')
             return _cx_json_safe(safe), (200 if result.get('status') == 'success' else 502)
         except Exception as error:
             current_app.logger.exception('[CxRTR] request_id=%s unexpected_failure', request_id)
