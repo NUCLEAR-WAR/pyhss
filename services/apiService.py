@@ -2466,6 +2466,29 @@ class ProvisionCxProfile(Resource):
         except Exception as error:return handle_exception(error)
 
 
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/live-ifc/<string:set_id>/')
+class ProvisionCxLiveIfc(Resource):
+    @auth_required
+    def get(self,ims_subscriber_id,set_id):
+        try:return _cx_json_safe(cxProvisioning.repo.live_ifc_get(ims_subscriber_id,set_id)),200
+        except ValueError as error:return {'status':'invalid_request','reason':str(error)},409
+        except Exception:return {'status':'internal_error'},500
+
+    @auth_required
+    def put(self,ims_subscriber_id,set_id):
+        try:
+            body=request.get_json(force=True)
+            if not isinstance(body,dict) or type(body.get('expected_version')) is not int:
+                return {'status':'invalid_request','reason':'expected_version integer required'},400
+            result=cxProvisioning.repo.live_ifc_save(ims_subscriber_id,set_id,body.get('ifc_xml'),body['expected_version'])
+            current_app.logger.info('[CxLiveIFC] subscriber=%s set=%s version=%s saved',ims_subscriber_id,set_id,result['version'])
+            return result,200
+        except (ValueError,sqlalchemy.exc.IntegrityError) as error:
+            return {'status':'conflict_or_invalid','reason':str(error)},409
+        except Exception:
+            current_app.logger.exception('[CxLiveIFC] save failed')
+            return {'status':'internal_error'},500
+
 @ns_provisioning.route('/cx/<int:ims_subscriber_id>/push-profile/')
 class ProvisionCxPushProfile(Resource):
     @auth_required

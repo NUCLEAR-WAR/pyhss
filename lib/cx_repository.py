@@ -98,6 +98,12 @@ class CxRepository:
         self.identities=Table('ims_cx_identity',self.metadata,
             Column('identity',String(512).with_variant(VARCHAR(512,collation='utf8mb4_bin'),'mysql'),primary_key=True),Column('kind',String(8),primary_key=True),
             Column('ims_subscriber_id',Integer,ForeignKey(self.profiles.c.ims_subscriber_id,ondelete='CASCADE'),nullable=False),mysql_charset='utf8mb4')
+        self.live_ifc=Table('ims_cx_live_ifc',self.metadata,
+            Column('ims_subscriber_id',Integer,ForeignKey(self.ims.c.ims_subscriber_id,ondelete='CASCADE'),primary_key=True),
+            Column('set_id',String(255),primary_key=True),
+            Column('version',Integer,nullable=False),
+            Column('ifc_xml',Text,nullable=False),
+            Column('updated_at',DateTime,nullable=False))
         self.states=Table('ims_cx_state',self.metadata,
             Column('ims_subscriber_id',Integer,ForeignKey(self.ims.c.ims_subscriber_id,ondelete='CASCADE'),primary_key=True),
             Column('scscf',String(512)),Column('realm',String(255)),Column('peer',String(512)),
@@ -433,6 +439,45 @@ class CxRepository:
         if not auc:raise CxError(5001,reason='native_auc_not_found')
         return dict(subscriber),dict(auc)
 
+    @staticmethod
+    def validate_live_ifc(xml_text):
+        """Only iFC nodes are editable; public identities and registration state are not."""
+        if not isinstance(xml_text,str) or len(xml_text)>131072 or '<!DOCTYPE' in xml_text.upper() or '<!ENTITY' in xml_text.upper():
+            raise ValueError('Invalid or oversized iFC XML')
+        root=ET.fromstring('<IFCList>'+xml_text+'</IFCList>')
+        if any(child.tag!='InitialFilterCriteria' for child in root):
+            raise ValueError('Only InitialFilterCriteria elements are allowed')
+        for ifc in root:
+            if ifc.find('Priority') is None or ifc.find('ApplicationServer/ServerName') is None:
+                raise ValueError('Each iFC needs Priority and ApplicationServer/ServerName')
+        return ''.join(ET.tostring(child,encoding='unicode') for child in root)
+
+    def live_ifc_get(self,profile_id,set_id):
+        with self.engine.connect() as c:
+            record=self.record(profile_id,c);d=self.definition(record,c)
+            if set_id not in {p['set_id'] for p in d['public_identities']}:raise ValueError('Unknown IRS')
+            row=c.execute(select(self.live_ifc).where(self.live_ifc.c.ims_subscriber_id==profile_id,self.live_ifc.c.set_id==set_id)).mappings().first()
+            profile={'record':record,'definition':d,'public':next(p for p in d['public_identities'] if p['set_id']==set_id)}
+            if row:return {'set_id':set_id,'version':row['version'],'ifc_xml':row['ifc_xml'],'source':'override'}
+            root=ET.fromstring(self.user_data(profile))
+            fragment=''.join(ET.tostring(x,encoding='unicode') for sp in root.findall('ServiceProfile') for x in sp.findall('InitialFilterCriteria'))
+            return {'set_id':set_id,'version':0,'ifc_xml':fragment,'source':'template'}
+
+    def live_ifc_save(self,profile_id,set_id,xml_text,expected_version):
+        fragment=self.validate_live_ifc(xml_text)
+        with self.transaction([profile_id]) as c:
+            record=self.record(profile_id,c);d=self.definition(record,c)
+            if not c.execute(select(self.profiles.c.ims_subscriber_id).where(self.profiles.c.ims_subscriber_id==profile_id)).first():
+                raise ValueError('Explicit Cx profile required for live edits')
+            if set_id not in {p['set_id'] for p in d['public_identities']}:raise ValueError('Unknown IRS')
+            row=c.execute(select(self.live_ifc).where(self.live_ifc.c.ims_subscriber_id==profile_id,self.live_ifc.c.set_id==set_id).with_for_update()).mappings().first()
+            version=row['version'] if row else 0
+            if version!=expected_version:raise ValueError('Version conflict: reload before saving')
+            values={'ifc_xml':fragment,'version':version+1,'updated_at':datetime.now(timezone.utc).replace(tzinfo=None)}
+            if row:c.execute(update(self.live_ifc).where(self.live_ifc.c.ims_subscriber_id==profile_id,self.live_ifc.c.set_id==set_id).values(**values))
+            else:c.execute(self.live_ifc.insert().values(ims_subscriber_id=profile_id,set_id=set_id,**values))
+            return {'set_id':set_id,'version':version+1,'saved':True}
+
     def user_data(self,profile,private=None):
         root=self.xml(profile['record']);d=profile['definition'];set_id=profile['public']['set_id']
         private=private or d['private_identities'][0]
@@ -457,6 +502,17 @@ class CxRepository:
             service_profiles[0].insert(len(service_profiles[0].findall('PublicIdentity')),element)
             ET.SubElement(element,'BarringIndication').text='1' if item['barred'] else '0'
             ET.SubElement(element,'Identity').text=item['identity']
+        # Replace only iFC nodes in the selected IRS; preserve PublicIdentity and barring.
+        with self.engine.connect() as c:
+            row=c.execute(select(self.live_ifc.c.ifc_xml).where(
+                self.live_ifc.c.ims_subscriber_id==profile['record']['ims_subscriber_id'],
+                self.live_ifc.c.set_id==set_id)).first()
+        if row:
+            overrides=ET.fromstring('<IFCList>'+row[0]+'</IFCList>')
+            for sp in service_profiles:
+                for element in list(sp.findall('InitialFilterCriteria')):sp.remove(element)
+            for element in overrides:
+                service_profiles[0].append(element)
         for sp in service_profiles:
             if not sp.findall('PublicIdentity'):root.remove(sp)
         return ET.tostring(root,encoding='unicode')
