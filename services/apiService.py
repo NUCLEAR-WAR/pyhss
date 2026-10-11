@@ -2640,7 +2640,7 @@ class ProvisionCxDeregister(Resource):
             # Reason 3 removes a retained S-CSCF assignment for an unregistered
             # IRS. It must not be used as a substitute for reason 0/2.
             eligible = ({k: v for k, v in groups.items()
-                         if v.get('state') == 'unregistered' and not v.get('registered')}
+                         if v.get('state') == 'unregistered' and not v.get('registered') and v.get('scscf')}
                         if reason_code == 3 else active)
             if not eligible:
                 return {'status': 'no_eligible_registration_set',

@@ -82,10 +82,17 @@ class CxProvisioning:
             # aliases below are metadata, not indexed authentication IMPIs.
             for identity in ('sip:'+number+'@'+realm,'tel:'+number):
                 public.append({'identity':identity,'set_id':set_id})
-            if mode!='aka':
-                for alias in (number+'@'+realm,number[1:]+'@'+realm):
-                    if alias!=primary:
-                        private.append(alias);aliases[alias]=primary
+            # Telephone-number Digest lookup aliases are optional compatibility
+            # identities, not additional authentication accounts. New fixed
+            # subscribers use the explicitly provisioned IMPI by default.
+            # Preserve aliases for existing subscribers until migrated safely.
+            legacy_aliases = (existing or {}).get('digest_identity_aliases') or {}
+            allow_aliases = policy.get('digest_lookup_aliases', bool(legacy_aliases))
+            if mode != 'aka' and allow_aliases:
+                for alias in (number+'@'+realm, number[1:]+'@'+realm):
+                    if alias != primary and (not legacy_aliases or alias in legacy_aliases):
+                        private.append(alias)
+                        aliases[alias] = primary
         private_public='sip:'+primary
         if not any(item['identity']==private_public for item in public):
             public.append({'identity':private_public,'set_id':set_id,'barred':policy.get('bar_private_impu',meta.get('bar_private_impu',True))})
