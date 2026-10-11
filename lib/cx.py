@@ -125,7 +125,6 @@ class CxService:
         if registration and (not sub or not sub.get('enabled',True)):raise CxError(5003,False)
         public=profile['public'];definition=profile['definition']
         if registration and not public.get('can_register',True):raise CxError(5003,False)
-        if registration and self.repo.registration_blocked(profile):raise CxError(5003,False,reason='administratively_blocked_registration')
         if public['barred'] and not any(not p['barred'] for p in definition['public_identities'] if p['set_id']==public['set_id']):raise CxError(5003,False)
         if visited is not None:
             allowed=definition.get('visited_networks') or self.settings.get('visited_networks') or [definition['digest_realm']]
@@ -144,9 +143,9 @@ class CxService:
         if typ==2:return 2001,self.capabilities(),False
         group=self.repo.group(state,profile['public']['set_id'])
         if typ==1:
-            if state['scscf'] and (group['state'] in ('registered','unregistered') or profile['private'] in group['pending']):return 2001,self.server(state['scscf']),False
+            if self.repo.assigned_server(state,profile['public']['set_id']) and (group['state'] in ('registered','unregistered') or profile['private'] in group['pending']):return 2001,self.server(self.repo.assigned_server(state,profile['public']['set_id'])),False
             raise CxError(5003)
-        if state['scscf']:return 2002,self.server(state['scscf']),True
+        if self.repo.assigned_server(state,profile['public']['set_id']):return 2002,self.server(self.repo.assigned_server(state,profile['public']['set_id'])),True
         return 2001,self.capabilities(),True
 
     def authentication_scheme(self,profile,requested):
@@ -198,7 +197,7 @@ class CxService:
                 if token_avp:
                     token=bytes.fromhex(token_avp['misc_data'])
                     if len(token)!=30:raise CxError(5004,False,(610,VENDOR,token_avp['misc_data']))
-                    if state['scscf']!=server:raise CxError(5012,False)
+                    if self.repo.assigned_server(state,profile['public']['set_id'])!=server:raise CxError(5012,False)
                     sqn_ms,mac=Milenage(b'\0\0').generate_resync(token[16:],key,opc,token[:16])
                     if not hmac.compare_digest(mac,token[-8:]):raise CxError(4001,False)
                     # Never roll back SQN on an old valid AUTS replay.
@@ -213,13 +212,12 @@ class CxService:
                         self.avp(609,rand+autn,VENDOR)+self.avp(610,xres,VENDOR)+self.avp(625,ck,VENDOR)+self.avp(626,ik,VENDOR))
                 c.execute(update(self.repo.auc).where(self.repo.auc.c.auc_id==auc['auc_id']).values(sqn=sqn+count))
             group=deepcopy(self.repo.group(state,profile['public']['set_id']))
-            if state['scscf']!=server:
-                for current in state['groups'].values():current['known_private']=[]
+            if self.repo.assigned_server(state,profile['public']['set_id'])!=server:
                 group['known_private']=[]
-            if group['state']!='registered' or state['scscf']!=server:
+            if group['state']!='registered' or self.repo.assigned_server(state,profile['public']['set_id'])!=server:
                 if profile['private'] not in group['pending']:group['pending'].append(profile['private'])
             state['groups'][profile['public']['set_id']]=group
-            state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
+            self.repo.assign_group(state,profile['public']['set_id'],server,self.text(avps,296),self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
             self.repo.save(state,c)
         return 2001,payload+self.avp(607,count,VENDOR,True)+vectors,False
 
@@ -239,8 +237,6 @@ class CxService:
                 _,definition=self.repo.find(private,'private',c)
             publics=[p['identity'] for p in definition['public_identities'] if private_key(private) in p['private_identities']]
         profiles=[self.repo.resolve(p,private) for p in publics]
-        if typ in (1,2) and any(self.repo.registration_blocked(p) for p in profiles):
-            raise CxError(5003,False,reason='administratively_blocked_registration')
         if private and any(private_key(private) in p['definition'].get('digest_identity_aliases',{}) for p in profiles):
             # MAA identifies the real authentication IMPI. A bootstrap lookup
             # name must not become a successful registration's private identity.
@@ -262,20 +258,20 @@ class CxService:
                 seen.add((ident,set_id))
                 state=states.setdefault(ident,self.repo.state(profile,c));group=deepcopy(self.repo.group(state,set_id))
                 if typ==0:
-                    if state['scscf']!=server:raise CxError(5012,False)
+                    if self.repo.assigned_server(state,profile['public']['set_id'])!=server:raise CxError(5012,False)
                     continue
-                if state['scscf'] and state['scscf']!=server:raise CxError(5005,server_name=state['scscf'])
+                if self.repo.assigned_server(state,set_id) and self.repo.assigned_server(state,set_id)!=server:raise CxError(5005,server_name=self.repo.assigned_server(state,set_id))
                 if typ in (1,2):
                     private=profile['private'];group['state']='registered'
                     if private not in group['registered']:group['registered'].append(private)
                     group['pending']=[p for p in group['pending'] if p!=private]
                     known=group.setdefault('known_private',[])
                     if private not in known:known.append(private)
-                    state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
+                    group.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
                 elif typ==3:
                     chosen=private or self.repo.default_authentication_identity(profile)
                     group={'state':'unregistered','registered':[],'pending':[],'known_private':[chosen]}
-                    state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
+                    group.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
                 elif typ in (9,10):
                     group['pending']=[p for p in group['pending'] if p!=profile['private']]
                 else:
@@ -297,6 +293,8 @@ class CxService:
                             group['known_private']=[]
                     if typ in (6,7) and not keep:code=2004;experimental=True
                 state['groups'][set_id]=group
+                if group['state']=='not_registered' and not group['pending']:
+                    self.repo.release_group(state,set_id)
                 if not any(g['state'] in ('registered','unregistered') or g['pending'] for g in state['groups'].values()):
                     state.update(scscf=None,realm=None,peer=None)
             if typ!=0:
@@ -311,9 +309,9 @@ class CxService:
         profile=self.repo.resolve(public)
         with self.repo.engine.connect() as c:state=self.repo.state(profile,c)
         group=self.repo.group(state,profile['public']['set_id'])
-        if group['state'] in ('registered','unregistered') and state['scscf']:return 2001,self.server(state['scscf']),False
+        if group['state'] in ('registered','unregistered') and self.repo.assigned_server(state,profile['public']['set_id']):return 2001,self.server(self.repo.assigned_server(state,profile['public']['set_id'])),False
         if originating or self.repo.terminating_unregistered_service(profile):
-            if state['scscf']:return 2001,self.server(state['scscf']),False
+            if self.repo.assigned_server(state,profile['public']['set_id']):return 2001,self.server(self.repo.assigned_server(state,profile['public']['set_id'])),False
             return 2003,self.capabilities(),True
         raise CxError(5003,reason='terminating_unregistered_service_not_available')
 

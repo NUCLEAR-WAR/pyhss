@@ -24,8 +24,7 @@ def reconcile_rtr(repo, subscriber_id, registration_set, private_identity,
         current = repo.state({'record': record, 'definition': definition}, connection)
         expected_group = (expected_state.get('groups') or {}).get(registration_set)
         actual_group = (current.get('groups') or {}).get(registration_set)
-        if (not expected_group or actual_group != expected_group or
-                any(current.get(k) != expected_state.get(k) for k in ('scscf', 'peer', 'realm'))):
+        if not expected_group or actual_group != expected_group:
             return {'hss_state_reconciled': False, 'reconciliation_status': 'state_changed',
                     'message': 'Concurrent registration or assignment change; no state overwritten'}
         if reason_code == 3:
@@ -44,18 +43,15 @@ def reconcile_rtr(repo, subscriber_id, registration_set, private_identity,
             group['pending'] = [identity for identity in group.get('pending', []) if identity != private_identity]
             group['state'] = 'registered' if group['registered'] else 'not_registered'
         current['groups'][registration_set] = group
-        # A single shared S-CSCF assignment is stored for the entire subscriber.
-        # Clear it only when NO IRS has a registered IMPI or retained assignment.
-        other_active = any(g.get('registered') or g.get('state') == 'unregistered'
-                           for g in current['groups'].values())
-        if not other_active:
-            current['scscf'] = None
-            current['realm'] = None
-            current['peer'] = None
+        # Assignment is owned by the affected IRS. Never clear another IRS's
+        # routing when it still has registrations or retained unregistered service.
+        if not group.get('registered') and group.get('state') != 'unregistered':
+            repo.release_group(current, registration_set)
+        assignment_cleared = not bool(current['groups'][registration_set].get('scscf'))
         repo.save(current, connection)
         return {'hss_state_reconciled': True, 'reconciliation_status': 'updated',
                 'affected_registration_set': registration_set,
                 'affected_private_identity': private_identity,
-                'scscf_assignment_cleared': not other_active,
+                'scscf_assignment_cleared': assignment_cleared,
                 'subscriber_deleted': False,
                 'sip_contact_removal_verified': False}

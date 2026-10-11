@@ -13,7 +13,7 @@ from pathlib import Path
 import json,re,uuid,hashlib
 import xml.etree.ElementTree as ET
 import jinja2
-from sqlalchemy import (Boolean,MetaData,Table,Column,Integer,String,Text,DateTime,
+from sqlalchemy import (MetaData,Table,Column,Integer,String,Text,DateTime,
                         ForeignKey,select,update,delete,inspect)
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.dialects.mysql import VARCHAR
@@ -112,12 +112,6 @@ class CxRepository:
             Column('profile_sha256',String(64),nullable=False),Column('status',String(48),nullable=False),
             Column('response_json',Text),Column('created_at',DateTime,nullable=False),
             Column('completed_at',DateTime))
-        self.reg_policy=Table('ims_cx_registration_policy',self.metadata,
-            Column('ims_subscriber_id',Integer,ForeignKey(self.ims.c.ims_subscriber_id,ondelete='CASCADE'),primary_key=True),
-            Column('set_id',String(255),primary_key=True),
-            Column('private_identity',String(512),primary_key=True),
-            Column('blocked',Boolean,nullable=False,default=False),
-            Column('updated_at',DateTime,nullable=False))
         self.states=Table('ims_cx_state',self.metadata,
             Column('ims_subscriber_id',Integer,ForeignKey(self.ims.c.ims_subscriber_id,ondelete='CASCADE'),primary_key=True),
             Column('scscf',String(512)),Column('realm',String(255)),Column('peer',String(512)),
@@ -415,12 +409,16 @@ class CxRepository:
         ident=profile['record']['ims_subscriber_id']
         row=c.execute(select(self.states).where(self.states.c.ims_subscriber_id==ident)).mappings().first()
         if row:
-            value=dict(row);value['groups']=json.loads(value.pop('groups_json'));return value
+            value=dict(row);value['groups']=json.loads(value.pop('groups_json'))
+            for group in value['groups'].values():
+                if 'scscf' not in group:
+                    group.update(scscf=value.get('scscf'),realm=value.get('realm'),peer=value.get('peer'))
+            return value
         record=profile['record'];registered=bool(record.get('scscf') and record.get('scscf_timestamp'))
         groups={}
         if registered:
             for public in profile['definition']['public_identities']:
-                groups[public['set_id']]={'state':'registered','registered':list(public['private_identities']),'pending':[]}
+                groups[public['set_id']]={'state':'registered','registered':list(public['private_identities']),'pending':[], 'scscf':record.get('scscf'), 'realm':record.get('scscf_realm'), 'peer':record.get('scscf_peer')}
         # scscf without a registration timestamp is a legacy provisioning hint,
         # not proof of an assignment. Never learn state from an initial UAR.
         return {'ims_subscriber_id':ident,'scscf':record.get('scscf') if registered else None,
@@ -432,6 +430,26 @@ class CxRepository:
     def group(state,set_id):
         return state['groups'].get(set_id,{'state':'not_registered','registered':[],'pending':[]})
 
+    @staticmethod
+    def assigned_server(state,set_id):
+        """Resolve an IRS assignment, falling back only for pre-migration state."""
+        group=(state.get('groups') or {}).get(set_id) or {}
+        if 'scscf' in group:
+            return group.get('scscf')
+        return state.get('scscf')
+
+    @staticmethod
+    def assign_group(state,set_id,server,realm=None,peer=None):
+        """Persist routing in the selected IRS without changing sibling groups."""
+        group=state.setdefault('groups',{}).setdefault(set_id,{'state':'not_registered','registered':[],'pending':[]})
+        group.update(scscf=server,realm=realm,peer=peer)
+
+    @staticmethod
+    def release_group(state,set_id):
+        group=state.setdefault('groups',{}).get(set_id)
+        if group is not None:
+            group.update(scscf=None,realm=None,peer=None)
+
     def save(self,state,c):
         state=deepcopy(state);ident=state['ims_subscriber_id'];now=datetime.now(timezone.utc).replace(tzinfo=None)
         groups=state.pop('groups');state.update(groups_json=json.dumps(groups),updated_at=now)
@@ -441,6 +459,17 @@ class CxRepository:
         if c.execute(select(self.states.c.ims_subscriber_id).where(self.states.c.ims_subscriber_id==ident)).first():
             c.execute(update(self.states).where(self.states.c.ims_subscriber_id==ident).values(**state))
         else:c.execute(self.states.insert().values(**state))
+        # Legacy subscriber-level assignment is a compatibility projection only.
+        # Never expose one IRS's S-CSCF as another IRS's destination.
+        assignments={g.get('scscf') for g in groups.values() if g.get('scscf') and
+                     (g.get('registered') or g.get('pending') or g.get('state')=='unregistered')}
+        if len(assignments)==1:
+            selected=next(g for g in groups.values() if g.get('scscf') in assignments)
+            state.update(scscf=selected.get('scscf'),realm=selected.get('realm'),peer=selected.get('peer'))
+        elif len(assignments)>1:
+            state.update(scscf=None,realm=None,peer=None)
+        elif any('scscf' in g for g in groups.values()):
+            state.update(scscf=None,realm=None,peer=None)
         # Keep existing Admin/statistics/API consumers synchronized. Pending
         # authentication stores routing but never stamps a successful registration.
         c.execute(update(self.ims).where(self.ims.c.ims_subscriber_id==ident).values(
@@ -540,44 +569,6 @@ class CxRepository:
             return {'saved_version':int(current[0]) if current else 0,
                     'acknowledged_version':row['profile_version'] if status=='success' else None,
                     'stale_after_push':(int(current[0]) if current else 0)!=row['profile_version']}
-
-    def registration_blocked(self, profile):
-        # Registration policy is per subscriber, IRS and canonical IMPI.
-        identity=profile['definition'].get('digest_identity_aliases',{}).get(profile['private'],profile['private'])
-        with self.engine.connect() as c:
-            row=c.execute(select(self.reg_policy.c.blocked).where(
-                self.reg_policy.c.ims_subscriber_id==profile['record']['ims_subscriber_id'],
-                self.reg_policy.c.set_id==profile['public']['set_id'],
-                self.reg_policy.c.private_identity==identity)).first()
-        return bool(row and row[0])
-
-    def registration_policy_update(self, ident, set_id, private_identity, blocked):
-        if type(blocked) is not bool:raise ValueError('blocked must be a boolean')
-        with self.transaction([ident]) as c:
-            record=self.record(ident,c);definition=self.definition(record,c)
-            aliases=definition.get('digest_identity_aliases') or {}
-            private_identity=aliases.get(private_identity,private_identity)
-            if private_identity not in definition['private_identities']:
-                raise ValueError('IMPI not provisioned for subscriber')
-            associated=any(p['set_id']==set_id and private_identity in
-                [aliases.get(x,x) for x in p.get('private_identities',definition['private_identities'])]
-                for p in definition['public_identities'])
-            if not associated:raise ValueError('IMPI is not associated with selected IRS')
-            key={'ims_subscriber_id':ident,'set_id':set_id,'private_identity':private_identity}
-            existing=c.execute(select(self.reg_policy.c.blocked).where(
-                self.reg_policy.c.ims_subscriber_id==ident,self.reg_policy.c.set_id==set_id,
-                self.reg_policy.c.private_identity==private_identity)).first()
-            if existing is None:c.execute(self.reg_policy.insert().values(**key,blocked=blocked,updated_at=datetime.utcnow()))
-            else:c.execute(self.reg_policy.update().where(
-                self.reg_policy.c.ims_subscriber_id==ident,self.reg_policy.c.set_id==set_id,
-                self.reg_policy.c.private_identity==private_identity).values(blocked=blocked,updated_at=datetime.utcnow()))
-        return dict(**key,blocked=blocked)
-
-    def registration_policies(self, ident):
-        with self.engine.connect() as c:
-            self.record(ident,c)
-            return [dict(row) for row in c.execute(select(self.reg_policy).where(
-                self.reg_policy.c.ims_subscriber_id==ident)).mappings()]
 
     def user_data(self,profile,private=None):
         root=self.xml(profile['record']);d=profile['definition'];set_id=profile['public']['set_id']
