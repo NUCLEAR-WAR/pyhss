@@ -82,21 +82,10 @@ class CxProvisioning:
             # aliases below are metadata, not indexed authentication IMPIs.
             for identity in ('sip:'+number+'@'+realm,'tel:'+number):
                 public.append({'identity':identity,'set_id':set_id})
-            # Telephone-number Digest lookup aliases are optional compatibility
-            # identities, not additional authentication accounts. New fixed
-            # subscribers use the explicitly provisioned IMPI by default.
-            # Preserve aliases for existing subscribers until migrated safely.
-            legacy_aliases = (existing or {}).get('digest_identity_aliases') or {}
-            allow_aliases = policy.get('digest_lookup_aliases', bool(legacy_aliases))
-            if mode != 'aka' and allow_aliases:
-                for alias in (number+'@'+realm, number[1:]+'@'+realm):
-                    if alias != primary and (not legacy_aliases or alias in legacy_aliases):
-                        private.append(alias)
-                        aliases[alias] = primary
         private_public='sip:'+primary
-        if not any(item['identity']==private_public for item in public):
+        if mode in ('aka','dual') and not any(item['identity']==private_public for item in public):
             public.append({'identity':private_public,'set_id':set_id,'barred':policy.get('bar_private_impu',meta.get('bar_private_impu',True))})
-        elif 'bar_private_impu' in policy:
+        elif mode in ('aka','dual') and 'bar_private_impu' in policy:
             next(item for item in public if item['identity']==private_public)['barred']=policy['bar_private_impu']
         private=list(dict.fromkeys(private))
         for item in public:item['private_identities']=list(private)
@@ -128,7 +117,7 @@ class CxProvisioning:
             'provisioning':{'authentication':mode,'realm':realm,'set_id':set_id,'private_identity':primary,
                 'custom_private_identity':bool(policy.get('private_identity') or meta.get('custom_private_identity')),
                 'managed_private':list(private),'managed_public':[item['identity'] for item in public],
-                'bar_private_impu':next(item.get('barred',False) for item in public if item['identity']==private_public),'additional_public_identities':deepcopy(explicit)}}
+                'bar_private_impu':next((item.get('barred',False) for item in public if item['identity']==private_public),False),'additional_public_identities':deepcopy(explicit)}}
         if existing:
             # Preserve explicitly provisioned non-generated identities and their policies.
             old_meta=existing.get('provisioning',{})

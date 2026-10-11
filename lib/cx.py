@@ -143,9 +143,9 @@ class CxService:
         if typ==2:return 2001,self.capabilities(),False
         group=self.repo.group(state,profile['public']['set_id'])
         if typ==1:
-            if self.repo.assigned_server(state,profile['public']['set_id']) and (group['state'] in ('registered','unregistered') or profile['private'] in group['pending']):return 2001,self.server(self.repo.assigned_server(state,profile['public']['set_id'])),False
+            if state['scscf'] and (group['state'] in ('registered','unregistered') or profile['private'] in group['pending']):return 2001,self.server(state['scscf']),False
             raise CxError(5003)
-        if self.repo.assigned_server(state,profile['public']['set_id']):return 2002,self.server(self.repo.assigned_server(state,profile['public']['set_id'])),True
+        if state['scscf']:return 2002,self.server(state['scscf']),True
         return 2001,self.capabilities(),True
 
     def authentication_scheme(self,profile,requested):
@@ -166,16 +166,12 @@ class CxService:
         if not isinstance(children,list):raise CxError(5004,False,(612,VENDOR,''))
         requested=self.text(children,608,VENDOR)
         token_avp=self.one(children,610,VENDOR,False)
-        profile=self.repo.resolve(public,private);scheme=self.authentication_scheme(profile,requested)
+        profile=self.repo.resolve(public,private);canonical=profile.get('canonical_private') or profile['private']
+        scheme=self.authentication_scheme(dict(profile,private=canonical),requested)
         if scheme=='SIP Digest':
-            canonical=profile['definition'].get('digest_identity_aliases',{}).get(profile['private'])
-            if canonical:
-                # Explicit operator-provisioned lookup alias, not a learned
-                # association or a guess from IMSI/MSISDN. MAA identifies the
-                # actual owner of the returned HA1, which Kamailio caches.
-                profile=self.repo.resolve(public,canonical)
-                self.authentication_scheme(profile,'SIP Digest')
-                private=profile['private']
+            # Keep the actual Digest username for HA1/MAA, but use the
+            # canonical provisioned IMPI for ownership and registration state.
+            profile=dict(profile,private=canonical)
         self.authorize(profile)
         maximum=int(self.settings.get('max_auth_items',5))
         if maximum<1:raise ValueError('max_auth_items must be positive')
@@ -197,7 +193,7 @@ class CxService:
                 if token_avp:
                     token=bytes.fromhex(token_avp['misc_data'])
                     if len(token)!=30:raise CxError(5004,False,(610,VENDOR,token_avp['misc_data']))
-                    if self.repo.assigned_server(state,profile['public']['set_id'])!=server:raise CxError(5012,False)
+                    if state['scscf']!=server:raise CxError(5012,False)
                     sqn_ms,mac=Milenage(b'\0\0').generate_resync(token[16:],key,opc,token[:16])
                     if not hmac.compare_digest(mac,token[-8:]):raise CxError(4001,False)
                     # Never roll back SQN on an old valid AUTS replay.
@@ -212,12 +208,13 @@ class CxService:
                         self.avp(609,rand+autn,VENDOR)+self.avp(610,xres,VENDOR)+self.avp(625,ck,VENDOR)+self.avp(626,ik,VENDOR))
                 c.execute(update(self.repo.auc).where(self.repo.auc.c.auc_id==auc['auc_id']).values(sqn=sqn+count))
             group=deepcopy(self.repo.group(state,profile['public']['set_id']))
-            if self.repo.assigned_server(state,profile['public']['set_id'])!=server:
+            if state['scscf']!=server:
+                for current in state['groups'].values():current['known_private']=[]
                 group['known_private']=[]
-            if group['state']!='registered' or self.repo.assigned_server(state,profile['public']['set_id'])!=server:
+            if group['state']!='registered' or state['scscf']!=server:
                 if profile['private'] not in group['pending']:group['pending'].append(profile['private'])
             state['groups'][profile['public']['set_id']]=group
-            self.repo.assign_group(state,profile['public']['set_id'],server,self.text(avps,296),self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
+            state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
             self.repo.save(state,c)
         return 2001,payload+self.avp(607,count,VENDOR,True)+vectors,False
 
@@ -236,7 +233,7 @@ class CxService:
             with self.repo.engine.connect() as c:
                 _,definition=self.repo.find(private,'private',c)
             publics=[p['identity'] for p in definition['public_identities'] if private_key(private) in p['private_identities']]
-        profiles=[self.repo.resolve(p,private) for p in publics]
+        profiles=[self.repo.resolve(p,private,canonical_private=True) for p in publics]
         if private and any(private_key(private) in p['definition'].get('digest_identity_aliases',{}) for p in profiles):
             # MAA identifies the real authentication IMPI. A bootstrap lookup
             # name must not become a successful registration's private identity.
@@ -245,7 +242,7 @@ class CxService:
         if self.values(avps,634,VENDOR) or self.values(avps,639,VENDOR) or self.integer(avps,655,default=0):raise CxError(5011)
         payload='';code=2001;experimental=False
         if typ in (0,1,2,3) and not available:
-            profile=profiles[0];chosen=private or self.repo.default_authentication_identity(profile)
+            profile=profiles[0];chosen=profile['private'] or self.repo.default_authentication_identity(profile)
             payload=self.avp(1,chosen)+self.avp(606,self.repo.user_data(profile,chosen),VENDOR)
             real_private=[identity for identity in profile['definition']['private_identities'] if identity not in profile['definition'].get('digest_identity_aliases',{})]
             if len(real_private)>1:
@@ -258,27 +255,27 @@ class CxService:
                 seen.add((ident,set_id))
                 state=states.setdefault(ident,self.repo.state(profile,c));group=deepcopy(self.repo.group(state,set_id))
                 if typ==0:
-                    if self.repo.assigned_server(state,profile['public']['set_id'])!=server:raise CxError(5012,False)
+                    if state['scscf']!=server:raise CxError(5012,False)
                     continue
-                if self.repo.assigned_server(state,set_id) and self.repo.assigned_server(state,set_id)!=server:raise CxError(5005,server_name=self.repo.assigned_server(state,set_id))
+                if state['scscf'] and state['scscf']!=server:raise CxError(5005,server_name=state['scscf'])
                 if typ in (1,2):
                     private=profile['private'];group['state']='registered'
                     if private not in group['registered']:group['registered'].append(private)
                     group['pending']=[p for p in group['pending'] if p!=private]
                     known=group.setdefault('known_private',[])
                     if private not in known:known.append(private)
-                    group.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
+                    state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
                 elif typ==3:
                     chosen=private or self.repo.default_authentication_identity(profile)
                     group={'state':'unregistered','registered':[],'pending':[],'known_private':[chosen]}
-                    group.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
+                    state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
                 elif typ in (9,10):
                     group['pending']=[p for p in group['pending'] if p!=profile['private']]
                 else:
                     if private is None and len(group['registered'])>1:raise CxError(5005,False,(1,0,''))
                     had_service_assignment=group['state'] in ('registered','unregistered')
-                    group['registered']=[p for p in group['registered'] if private and p!=private_key(private)]
-                    group['pending']=[p for p in group['pending'] if private and p!=private_key(private)]
+                    group['registered']=[p for p in group['registered'] if private and p!=profile['private']]
+                    group['pending']=[p for p in group['pending'] if private and p!=profile['private']]
                     keep=typ in (6,7) and self.settings.get('store_server_on_deregistration',True)
                     if group['registered']:group['state']='registered'
                     elif keep:group['state']='unregistered'
@@ -293,8 +290,6 @@ class CxService:
                             group['known_private']=[]
                     if typ in (6,7) and not keep:code=2004;experimental=True
                 state['groups'][set_id]=group
-                if group['state']=='not_registered' and not group['pending']:
-                    self.repo.release_group(state,set_id)
                 if not any(g['state'] in ('registered','unregistered') or g['pending'] for g in state['groups'].values()):
                     state.update(scscf=None,realm=None,peer=None)
             if typ!=0:
@@ -309,124 +304,31 @@ class CxService:
         profile=self.repo.resolve(public)
         with self.repo.engine.connect() as c:state=self.repo.state(profile,c)
         group=self.repo.group(state,profile['public']['set_id'])
-        if group['state'] in ('registered','unregistered') and self.repo.assigned_server(state,profile['public']['set_id']):return 2001,self.server(self.repo.assigned_server(state,profile['public']['set_id'])),False
+        if group['state'] in ('registered','unregistered') and state['scscf']:return 2001,self.server(state['scscf']),False
         if originating or self.repo.terminating_unregistered_service(profile):
-            if self.repo.assigned_server(state,profile['public']['set_id']):return 2001,self.server(self.repo.assigned_server(state,profile['public']['set_id'])),False
+            if state['scscf']:return 2001,self.server(state['scscf']),False
             return 2003,self.capabilities(),True
         raise CxError(5003,reason='terminating_unregistered_service_not_available')
 
-    def ppr(self, ims_subscriber_id, destination_host, destination_realm, registration_set, private_identity):
-        """Build Cx PPR (305) from saved IMS subscription; never synthesize IMPUs."""
-        with self.repo.engine.connect() as connection:
-            record = self.repo.record(ims_subscriber_id, connection)
-            definition = self.repo.definition(record, connection)
-            profile = {'record': record, 'definition': definition}
-            state = self.repo.state(profile, connection)
-            group = (state.get('groups') or {}).get(registration_set)
-            if not group or private_identity not in (group.get('registered') or []):
-                raise ValueError('Selected IMPI is not registered in the requested IRS')
-            aliases = definition.get('digest_identity_aliases') or {}
-            associated = [p for p in definition['public_identities']
-                          if p['set_id'] == registration_set and private_identity in
-                          [aliases.get(i, i) for i in p.get('private_identities', definition['private_identities'])]]
-            if not associated:
-                raise ValueError('IMPI is not associated with any IMPU in selected IRS')
-            profile['public'] = associated[0]
-            xml = self.repo.user_data(profile, private=private_identity)
-        import uuid
-        sid = bytes.fromhex(self.d.OriginHost).decode() + ';cx-ppr;' + uuid.uuid4().hex
-        payload = self.avp(263, sid)
-        payload += self.grouped(260, self.avp(266, VENDOR, integer=True) + self.avp(258, CX_APP, integer=True), vendor=0)
-        payload += self.avp(277, 1, integer=True)
-        payload += self.d.generate_avp(264, '40', self.d.OriginHost)
-        payload += self.d.generate_avp(296, '40', self.d.OriginRealm)
-        payload += self.avp(293, destination_host) + self.avp(283, destination_realm)
-        payload += self.avp(1, private_identity)
-        payload += self.avp(606, xml, VENDOR)
-        return self.d.generate_diameter_packet('01', 'c0', 305, CX_APP,
-                                               self.d.generate_id(4), self.d.generate_id(4), payload)
-
-    def rtr(self, imsi, destination_host, destination_realm, registration_sets=None, private_identity=None, reason_code=0, reason_info=None):
-        """Build a Cx RTR for active implicit registration sets.
-
-        Public-Identity AVP 601 is mandatory for our Kamailio S-CSCF. Only
-        provisioned identities belonging to the selected active IRS are sent.
-        Never derive public identities from an IMSI or incoming SIP URI.
-        """
-        with self.repo.engine.connect() as connection:
-            records = connection.execute(
-                select(self.repo.ims).where(self.repo.ims.c.imsi == imsi)
-            ).mappings().all()
-            if len(records) != 1:
-                raise CxError(5001)
-            record = dict(records[0])
-            definition = self.repo.definition(record, connection)
-            state = self.repo.state({'record': record, 'definition': definition}, connection)
-            groups = state.get('groups') or {}
-            active = {name: group for name, group in groups.items() if group.get('registered')}
-            eligible = ({name: group for name, group in groups.items() if group.get('state') == 'unregistered' and not group.get('registered')}
-                        if reason_code == 3 else active)
-            selected = list(registration_sets) if registration_sets is not None else list(eligible)
-            if not selected or any(name not in eligible for name in selected):
-                raise ValueError('RTR requires IRS groups eligible for the selected reason')
-            public = []
-            for identity in definition['public_identities']:
-                if identity['set_id'] in selected and identity['identity'] not in public:
-                    public.append(identity['identity'])
-            if not public:
-                raise ValueError('RTR has no provisioned public identities in active IRS')
-            if type(reason_code) is not int or reason_code not in (0, 1, 2, 3):
-                raise ValueError('RTR reason_code must be 0, 1, 2 or 3')
-            if reason_code == 3 and any(name in active for name in selected):
-                raise ValueError('REMOVE_S-CSCF cannot target registered IRS')
-            aliases = definition.get('digest_identity_aliases', {})
-            associated = set()
-            for identity in definition['public_identities']:
-                if identity['set_id'] in selected:
-                    associated.update(aliases.get(i, i) for i in
-                                      identity.get('private_identities', definition['private_identities']))
-            registered = set()
-            for name in selected:
-                registered.update(aliases.get(x, x) for x in eligible[name].get('registered', []))
-            candidates = associated if reason_code == 3 else registered
-            candidates &= set(definition['private_identities'])
-            if not candidates:
-                raise ValueError('RTR has no eligible associated private identity')
-            if not private_identity:
-                if len(candidates) != 1:
-                    raise ValueError('Multiple eligible IMPIs: specify private_identity')
-                target = next(iter(candidates))
-            else:
-                target = aliases.get(private_identity, private_identity)
-                if target not in candidates:
-                    raise ValueError('Requested IMPI is not eligible for selected IRS')
-            # Do not include an IMPU which is not authorized for the selected IMPI.
-            public = [x['identity'] for x in definition['public_identities']
-                      if x['set_id'] in selected and target in
-                      [aliases.get(i, i) for i in x.get('private_identities', definition['private_identities'])]]
-            public = list(dict.fromkeys(public))
-            if not public:
-                raise ValueError('No associated public identities for selected IMPI and IRS')
-        sid = bytes.fromhex(self.d.OriginHost).decode() + ';cx-rtr;' + __import__('uuid').uuid4().hex
-        payload = self.avp(263, sid)
-        payload += self.d.generate_avp(264, '40', self.d.OriginHost)
-        payload += self.d.generate_avp(296, '40', self.d.OriginRealm)
-        payload += self.grouped(260, self.avp(266, VENDOR, integer=True)
-                                + self.avp(258, CX_APP, integer=True), vendor=0)
-        payload += self.avp(277, 1, integer=True)
-        payload += self.avp(293, destination_host) + self.avp(283, destination_realm)
-        payload += self.avp(1, target)
-        reason_labels = {0: 'Permanent termination', 1: 'New S-CSCF assigned',
-                         2: 'S-CSCF change', 3: 'Remove S-CSCF assignment'}
-        info = reason_labels[reason_code] if reason_info is None else reason_info
-        if not isinstance(info, str) or len(info.encode('utf-8')) > 512:
-            raise ValueError('reason_info must be UTF-8 text up to 512 bytes')
-        reason_avps = self.avp(616, reason_code, VENDOR, True)
-        if info:
-            reason_avps += self.avp(617, info, VENDOR)
-        payload += self.grouped(615, reason_avps)
-        for impu in public:
-            payload += self.avp(601, impu, VENDOR)
-        return self.d.generate_diameter_packet('01', 'c0', 304, CX_APP,
-                                               self.d.generate_id(4), self.d.generate_id(4), payload)
-
+    def rtr(self,imsi,destination_host,destination_realm):
+        """Terminate a provisioned IMS subscription using its actual private IDs."""
+        with self.repo.engine.connect() as c:
+            records=c.execute(select(self.repo.ims).where(self.repo.ims.c.imsi==imsi)).mappings().all()
+            if len(records)!=1:raise CxError(5001)
+            definition=self.repo.definition(dict(records[0]),c)
+            profile={'record':dict(records[0]),'definition':definition}
+            state=self.repo.state(profile,c)
+            known=[]
+            for group in state['groups'].values():
+                for identity in group.get('known_private',group['registered']):
+                    if identity not in known:known.append(identity)
+            target=known[0] if known else definition['private_identities'][0]
+            target=definition.get('digest_identity_aliases',{}).get(target,target)
+        sid=bytes.fromhex(self.d.OriginHost).decode()+';cx-rtr;'+__import__('uuid').uuid4().hex
+        payload=self.avp(263,sid)+self.d.generate_avp(264,'40',self.d.OriginHost)+self.d.generate_avp(296,'40',self.d.OriginRealm)
+        payload+=self.grouped(260,self.avp(266,VENDOR,integer=True)+self.avp(258,CX_APP,integer=True),vendor=0)
+        payload+=self.avp(277,1,integer=True)+self.avp(293,destination_host)+self.avp(283,destination_realm)+self.avp(1,target)
+        payload+=self.grouped(615,self.avp(616,0,VENDOR,True)+self.avp(617,'Administrative de-registration',VENDOR))
+        associated=[x for x in definition['private_identities'] if x!=target and x not in definition.get('digest_identity_aliases',{})]
+        if associated:payload+=self.grouped(632,''.join(self.avp(1,x) for x in associated))
+        return self.d.generate_diameter_packet('01','c0',304,CX_APP,self.d.generate_id(4),self.d.generate_id(4),payload)

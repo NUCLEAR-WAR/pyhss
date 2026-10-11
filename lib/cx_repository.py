@@ -10,7 +10,7 @@ from contextlib import contextmanager,nullcontext
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-import json,re,uuid,hashlib
+import json,re
 import xml.etree.ElementTree as ET
 import jinja2
 from sqlalchemy import (MetaData,Table,Column,Integer,String,Text,DateTime,
@@ -98,20 +98,6 @@ class CxRepository:
         self.identities=Table('ims_cx_identity',self.metadata,
             Column('identity',String(512).with_variant(VARCHAR(512,collation='utf8mb4_bin'),'mysql'),primary_key=True),Column('kind',String(8),primary_key=True),
             Column('ims_subscriber_id',Integer,ForeignKey(self.profiles.c.ims_subscriber_id,ondelete='CASCADE'),nullable=False),mysql_charset='utf8mb4')
-        self.live_ifc=Table('ims_cx_live_ifc',self.metadata,
-            Column('ims_subscriber_id',Integer,ForeignKey(self.ims.c.ims_subscriber_id,ondelete='CASCADE'),primary_key=True),
-            Column('set_id',String(255),primary_key=True),
-            Column('version',Integer,nullable=False),
-            Column('ifc_xml',Text,nullable=False),
-            Column('updated_at',DateTime,nullable=False))
-        self.ppr_audit=Table('ims_cx_ppr_audit',self.metadata,
-            Column('operation_id',String(64),primary_key=True),
-            Column('ims_subscriber_id',Integer,ForeignKey(self.ims.c.ims_subscriber_id,ondelete='CASCADE'),nullable=False),
-            Column('set_id',String(255),nullable=False),Column('private_identity',String(512),nullable=False),
-            Column('scscf',String(512)),Column('profile_version',Integer,nullable=False),
-            Column('profile_sha256',String(64),nullable=False),Column('status',String(48),nullable=False),
-            Column('response_json',Text),Column('created_at',DateTime,nullable=False),
-            Column('completed_at',DateTime))
         self.states=Table('ims_cx_state',self.metadata,
             Column('ims_subscriber_id',Integer,ForeignKey(self.ims.c.ims_subscriber_id,ondelete='CASCADE'),primary_key=True),
             Column('scscf',String(512)),Column('realm',String(255)),Column('peer',String(512)),
@@ -273,16 +259,13 @@ class CxRepository:
         if not isinstance(aliases,dict):raise ValueError('digest_identity_aliases must map lookup identities to authentication identities')
         d['digest_identity_aliases']={private_key(source):private_key(target) for source,target in aliases.items()}
         for source,target in d['digest_identity_aliases'].items():
-            if source==target or source not in d['private_identities'] or target not in d['private_identities']:
-                raise ValueError('Digest aliases must reference distinct provisioned private identities')
-            if target in d['digest_identity_aliases']:raise ValueError('Chained or cyclic Digest identity aliases are not supported')
-            for identity in (source,target):
-                schemes=d['authentication_schemes'].get(identity,d['authentication_scheme'])
-                if 'SIP Digest' not in ([schemes] if isinstance(schemes,str) else schemes):
-                    raise ValueError('Both Digest alias identities must explicitly allow SIP Digest')
-            for public in d['public_identities']:
-                if source in public['private_identities'] and target not in public['private_identities']:
-                    raise ValueError('Digest alias target must be associated with every public identity served by its lookup alias')
+            if source==target or target not in d['private_identities'] or source in d['private_identities']:
+                raise ValueError('Digest aliases must be lookup-only and point to real private identities')
+            if target in d['digest_identity_aliases']:
+                raise ValueError('Chained Digest aliases are not supported')
+            schemes=d['authentication_schemes'].get(target,d['authentication_scheme'])
+            if 'SIP Digest' not in ([schemes] if isinstance(schemes,str) else schemes):
+                raise ValueError('Digest alias target must support SIP Digest')
         d.setdefault('digest_realm',d['private_identities'][0].rpartition('@')[2])
         if not isinstance(d['digest_realm'],str) or not d['digest_realm']:raise ValueError('Digest realm must be provisioned')
         d.setdefault('unregistered_service',False)
@@ -387,38 +370,52 @@ class CxRepository:
 
     def resolve(self,public,private=None,c=None,canonical_private=False):
         if c is None:
-            with self.engine.connect() as conn:return self.resolve(public,private,conn,canonical_private)
+            with self.engine.connect() as conn:
+                return self.resolve(public,private,conn,canonical_private)
         record,d=self.find(public,'public',c)
         item=next(x for x in d['public_identities'] if x['identity']==public_key(public))
+        requested=None;target=None
         if private is not None:
             try:requested=private_key(private)
             except ValueError:raise CxError(5001,reason='invalid_private_identity_format')
-            target=d.get('digest_identity_aliases',{}).get(requested,requested)
-            if target!=requested:
-                # Compatibility names are scoped by a provisioned public
-                # profile, never by a global number search or a learned binding.
-                other=c.execute(select(self.identities.c.ims_subscriber_id).where(self.identities.c.identity==requested,self.identities.c.kind=='private')).first()
+            target=requested
+            if requested not in item['private_identities']:
+                # Fixed SIP Digest bootstrap: I-CSCF can supply a telephone
+                # number from the IMPU before the UE has authenticated.
+                # Only an EXACT public URI user-part match is accepted, and
+                # only when the public identity has one unambiguous Digest owner.
+                aliases=d.get('digest_identity_aliases',{})
+                target=aliases.get(requested)
+                if target is None and d.get('service_type')=='fixed_voice' and item['identity'].startswith('sip:'):
+                    user,sep,domain=item['identity'][4:].partition('@')
+                    candidate=requested.partition('@')
+                    if sep and candidate[2]==domain and candidate[0] in (user,user.lstrip('+')):
+                        eligible=[identity for identity in item['private_identities']
+                                  if 'SIP Digest' in self.authentication_schemes({'definition':d,'private':identity})]
+                        if len(eligible)==1:target=eligible[0]
+                if target is None:raise CxError(5002,reason='private_public_identity_mismatch')
+                # Do not allow a bootstrap alias that is actually another
+                # subscriber's real IMPI.
+                other=c.execute(select(self.identities.c.ims_subscriber_id).where(
+                    self.identities.c.identity==requested,self.identities.c.kind=='private')).first()
                 if other and other[0]!=record['ims_subscriber_id']:raise CxError(5002)
-                if requested not in item['private_identities']:raise CxError(5002)
+            if target not in item['private_identities']:raise CxError(5002)
             private_record,_=self.find(target,'private',c)
-            if private_record['ims_subscriber_id']!=record['ims_subscriber_id'] or target not in item['private_identities']:raise CxError(5002)
+            if private_record['ims_subscriber_id']!=record['ims_subscriber_id']:raise CxError(5002)
         return {'record':record,'definition':d,'public':item,
-                'private':(target if canonical_private else requested) if private is not None else None}
+                'private':target if canonical_private else requested,
+                'canonical_private':target,'requested_private':requested}
 
     def state(self,profile,c):
         ident=profile['record']['ims_subscriber_id']
         row=c.execute(select(self.states).where(self.states.c.ims_subscriber_id==ident)).mappings().first()
         if row:
-            value=dict(row);value['groups']=json.loads(value.pop('groups_json'))
-            for group in value['groups'].values():
-                if 'scscf' not in group:
-                    group.update(scscf=value.get('scscf'),realm=value.get('realm'),peer=value.get('peer'))
-            return value
+            value=dict(row);value['groups']=json.loads(value.pop('groups_json'));return value
         record=profile['record'];registered=bool(record.get('scscf') and record.get('scscf_timestamp'))
         groups={}
         if registered:
             for public in profile['definition']['public_identities']:
-                groups[public['set_id']]={'state':'registered','registered':list(public['private_identities']),'pending':[], 'scscf':record.get('scscf'), 'realm':record.get('scscf_realm'), 'peer':record.get('scscf_peer')}
+                groups[public['set_id']]={'state':'registered','registered':list(public['private_identities']),'pending':[]}
         # scscf without a registration timestamp is a legacy provisioning hint,
         # not proof of an assignment. Never learn state from an initial UAR.
         return {'ims_subscriber_id':ident,'scscf':record.get('scscf') if registered else None,
@@ -430,26 +427,6 @@ class CxRepository:
     def group(state,set_id):
         return state['groups'].get(set_id,{'state':'not_registered','registered':[],'pending':[]})
 
-    @staticmethod
-    def assigned_server(state,set_id):
-        """Resolve an IRS assignment, falling back only for pre-migration state."""
-        group=(state.get('groups') or {}).get(set_id) or {}
-        if 'scscf' in group:
-            return group.get('scscf')
-        return state.get('scscf')
-
-    @staticmethod
-    def assign_group(state,set_id,server,realm=None,peer=None):
-        """Persist routing in the selected IRS without changing sibling groups."""
-        group=state.setdefault('groups',{}).setdefault(set_id,{'state':'not_registered','registered':[],'pending':[]})
-        group.update(scscf=server,realm=realm,peer=peer)
-
-    @staticmethod
-    def release_group(state,set_id):
-        group=state.setdefault('groups',{}).get(set_id)
-        if group is not None:
-            group.update(scscf=None,realm=None,peer=None)
-
     def save(self,state,c):
         state=deepcopy(state);ident=state['ims_subscriber_id'];now=datetime.now(timezone.utc).replace(tzinfo=None)
         groups=state.pop('groups');state.update(groups_json=json.dumps(groups),updated_at=now)
@@ -459,17 +436,6 @@ class CxRepository:
         if c.execute(select(self.states.c.ims_subscriber_id).where(self.states.c.ims_subscriber_id==ident)).first():
             c.execute(update(self.states).where(self.states.c.ims_subscriber_id==ident).values(**state))
         else:c.execute(self.states.insert().values(**state))
-        # Legacy subscriber-level assignment is a compatibility projection only.
-        # Never expose one IRS's S-CSCF as another IRS's destination.
-        assignments={g.get('scscf') for g in groups.values() if g.get('scscf') and
-                     (g.get('registered') or g.get('pending') or g.get('state')=='unregistered')}
-        if len(assignments)==1:
-            selected=next(g for g in groups.values() if g.get('scscf') in assignments)
-            state.update(scscf=selected.get('scscf'),realm=selected.get('realm'),peer=selected.get('peer'))
-        elif len(assignments)>1:
-            state.update(scscf=None,realm=None,peer=None)
-        elif any('scscf' in g for g in groups.values()):
-            state.update(scscf=None,realm=None,peer=None)
         # Keep existing Admin/statistics/API consumers synchronized. Pending
         # authentication stores routing but never stamps a successful registration.
         c.execute(update(self.ims).where(self.ims.c.ims_subscriber_id==ident).values(
@@ -481,94 +447,6 @@ class CxRepository:
         auc=c.execute(select(self.auc).where(self.auc.c.auc_id==subscriber['auc_id']).with_for_update()).mappings().first()
         if not auc:raise CxError(5001,reason='native_auc_not_found')
         return dict(subscriber),dict(auc)
-
-    @staticmethod
-    def validate_live_ifc(xml_text):
-        """Only iFC nodes are editable; public identities and registration state are not."""
-        if not isinstance(xml_text,str) or len(xml_text)>131072 or '<!DOCTYPE' in xml_text.upper() or '<!ENTITY' in xml_text.upper():
-            raise ValueError('Invalid or oversized iFC XML')
-        root=ET.fromstring('<IFCList>'+xml_text+'</IFCList>')
-        if any(child.tag!='InitialFilterCriteria' for child in root):
-            raise ValueError('Only InitialFilterCriteria elements are allowed')
-        for ifc in root:
-            if ifc.find('Priority') is None or ifc.find('ApplicationServer/ServerName') is None:
-                raise ValueError('Each iFC needs Priority and ApplicationServer/ServerName')
-        return ''.join(ET.tostring(child,encoding='unicode') for child in root)
-
-    def live_ifc_get(self,profile_id,set_id):
-        with self.engine.connect() as c:
-            record=self.record(profile_id,c);d=self.definition(record,c)
-            if set_id not in {p['set_id'] for p in d['public_identities']}:raise ValueError('Unknown IRS')
-            row=c.execute(select(self.live_ifc).where(self.live_ifc.c.ims_subscriber_id==profile_id,self.live_ifc.c.set_id==set_id)).mappings().first()
-            profile={'record':record,'definition':d,'public':next(p for p in d['public_identities'] if p['set_id']==set_id)}
-            if row:return {'set_id':set_id,'version':row['version'],'ifc_xml':row['ifc_xml'],'source':'override'}
-            root=ET.fromstring(self.user_data(profile))
-            fragment=''.join(ET.tostring(x,encoding='unicode') for sp in root.findall('ServiceProfile') for x in sp.findall('InitialFilterCriteria'))
-            return {'set_id':set_id,'version':0,'ifc_xml':fragment,'source':'template'}
-
-    def live_ifc_save(self,profile_id,set_id,xml_text,expected_version):
-        fragment=self.validate_live_ifc(xml_text)
-        with self.transaction([profile_id]) as c:
-            record=self.record(profile_id,c);d=self.definition(record,c)
-            if not c.execute(select(self.profiles.c.ims_subscriber_id).where(self.profiles.c.ims_subscriber_id==profile_id)).first():
-                raise ValueError('Explicit Cx profile required for live edits')
-            if set_id not in {p['set_id'] for p in d['public_identities']}:raise ValueError('Unknown IRS')
-            row=c.execute(select(self.live_ifc).where(self.live_ifc.c.ims_subscriber_id==profile_id,self.live_ifc.c.set_id==set_id).with_for_update()).mappings().first()
-            version=row['version'] if row else 0
-            if version!=expected_version:raise ValueError('Version conflict: reload before saving')
-            values={'ifc_xml':fragment,'version':version+1,'updated_at':datetime.now(timezone.utc).replace(tzinfo=None)}
-            if row:c.execute(update(self.live_ifc).where(self.live_ifc.c.ims_subscriber_id==profile_id,self.live_ifc.c.set_id==set_id).values(**values))
-            else:c.execute(self.live_ifc.insert().values(ims_subscriber_id=profile_id,set_id=set_id,**values))
-            return {'set_id':set_id,'version':version+1,'saved':True}
-
-    def live_ifc_version(self,profile_id,set_id):
-        with self.engine.connect() as c:
-            row=c.execute(select(self.live_ifc.c.version).where(
-                self.live_ifc.c.ims_subscriber_id==profile_id,self.live_ifc.c.set_id==set_id)).first()
-            return int(row[0]) if row else 0
-
-    def ppr_history(self,profile_id,set_id=None,limit=50):
-        with self.engine.connect() as c:
-            query=select(self.ppr_audit).where(self.ppr_audit.c.ims_subscriber_id==profile_id)
-            if set_id is not None:query=query.where(self.ppr_audit.c.set_id==set_id)
-            rows=c.execute(query.order_by(self.ppr_audit.c.created_at.desc()).limit(min(max(int(limit),1),100))).mappings()
-            return [dict(r) for r in rows]
-
-    def ppr_begin(self,profile_id,set_id,private_identity,scscf,expected_version=None):
-        """Lock version and registration state; snapshot immutable effective user-data."""
-        with self.transaction([profile_id]) as c:
-            record=self.record(profile_id,c);definition=self.definition(record,c)
-            state=self.state({'record':record,'definition':definition},c)
-            group=(state.get('groups') or {}).get(set_id) or {}
-            if private_identity not in (group.get('registered') or []):raise ValueError('Selected IMPI is not registered in this IRS')
-            if state.get('scscf')!=scscf:raise ValueError('Assigned S-CSCF changed; reload')
-            row=c.execute(select(self.live_ifc).where(self.live_ifc.c.ims_subscriber_id==profile_id,self.live_ifc.c.set_id==set_id)).mappings().first()
-            version=int(row['version']) if row else 0
-            if expected_version is not None and version!=expected_version:raise ValueError('Version conflict; reload before push')
-            public=next((p for p in definition['public_identities'] if p['set_id']==set_id and private_identity in p['private_identities']),None)
-            if public is None:raise ValueError('IMPI not associated with selected IRS')
-            profile={'record':record,'definition':definition,'public':public}
-            # Store the digest for audit; the sender still renders the committed DB version.
-            digest=hashlib.sha256((str(version)+'|'+set_id+'|'+private_identity+'|'+(row['ifc_xml'] if row else '')).encode('utf-8')).hexdigest()
-            operation_id=uuid.uuid4().hex
-            c.execute(self.ppr_audit.insert().values(operation_id=operation_id,ims_subscriber_id=profile_id,
-                set_id=set_id,private_identity=private_identity,scscf=scscf,profile_version=version,
-                profile_sha256=digest,status='pending',created_at=datetime.now(timezone.utc).replace(tzinfo=None)))
-            return {'operation_id':operation_id,'version':version,'sha256':digest}
-
-    def ppr_finish(self,operation_id,status,result):
-        now=datetime.now(timezone.utc).replace(tzinfo=None)
-        with self.engine.begin() as c:
-            row=c.execute(select(self.ppr_audit).where(self.ppr_audit.c.operation_id==operation_id).with_for_update()).mappings().first()
-            if row is None:raise ValueError('Unknown PPR operation')
-            if row['status']!='pending':raise ValueError('PPR already finalized')
-            c.execute(update(self.ppr_audit).where(self.ppr_audit.c.operation_id==operation_id).values(
-                status=status,response_json=json.dumps(result,default=str)[:32768],completed_at=now))
-            current=c.execute(select(self.live_ifc.c.version).where(self.live_ifc.c.ims_subscriber_id==row['ims_subscriber_id'],
-                self.live_ifc.c.set_id==row['set_id'])).first()
-            return {'saved_version':int(current[0]) if current else 0,
-                    'acknowledged_version':row['profile_version'] if status=='success' else None,
-                    'stale_after_push':(int(current[0]) if current else 0)!=row['profile_version']}
 
     def user_data(self,profile,private=None):
         root=self.xml(profile['record']);d=profile['definition'];set_id=profile['public']['set_id']
@@ -594,17 +472,6 @@ class CxRepository:
             service_profiles[0].insert(len(service_profiles[0].findall('PublicIdentity')),element)
             ET.SubElement(element,'BarringIndication').text='1' if item['barred'] else '0'
             ET.SubElement(element,'Identity').text=item['identity']
-        # Replace only iFC nodes in the selected IRS; preserve PublicIdentity and barring.
-        with self.engine.connect() as c:
-            row=c.execute(select(self.live_ifc.c.ifc_xml).where(
-                self.live_ifc.c.ims_subscriber_id==profile['record']['ims_subscriber_id'],
-                self.live_ifc.c.set_id==set_id)).first()
-        if row:
-            overrides=ET.fromstring('<IFCList>'+row[0]+'</IFCList>')
-            for sp in service_profiles:
-                for element in list(sp.findall('InitialFilterCriteria')):sp.remove(element)
-            for element in overrides:
-                service_profiles[0].append(element)
         for sp in service_profiles:
             if not sp.findall('PublicIdentity'):root.remove(sp)
         return ET.tostring(root,encoding='unicode')
