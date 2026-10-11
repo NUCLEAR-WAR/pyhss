@@ -10,6 +10,7 @@ from copy import deepcopy
 import hashlib
 import hmac
 import json
+import traceback
 from datetime import datetime,timezone
 from sqlalchemy import select,update
 from cx_repository import CxRepository,CxError,public_key,private_key
@@ -115,7 +116,7 @@ class CxService:
             return self.answer(packet,avps,error.code,self.server(error.server_name) if error.server_name else '',error.experimental,error.failed_avp)
         except Exception as error:
             # Backend/profile failures never become success or mutate partial state.
-            self.d.logTool.log(service='HSS',level='error',message=f'Cx {packet["command_code"]} failed ({type(error).__name__})',redisClient=self.d.redisMessaging)
+            self.d.logTool.log(service='HSS',level='error',message=f'Cx {packet["command_code"]} failed ({type(error).__name__}): {error}; traceback={traceback.format_exc()}',redisClient=self.d.redisMessaging)
             return self.answer(packet,avps,5012)
 
     def authorize(self,profile,visited=None,emergency=False,registration=True):
