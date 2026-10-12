@@ -169,22 +169,32 @@ class CxService:
         token_avp=self.one(children,610,VENDOR,False)
         profile=self.repo.resolve(public,private);canonical=profile.get('canonical_private') or profile['private']
         scheme=self.authentication_scheme(dict(profile,private=canonical),requested)
+        # A fixed-Digest initial REGISTER can reach Cx with a bootstrap
+        # User-Name derived from the public identity. The repository has
+        # already validated its association with a unique provisioned IMPI.
+        # Kamailio indexes the MAA vector by the returned User-Name, so the
+        # first challenge must be keyed by that canonical IMPI.
+        digest_username=private
         if scheme=='SIP Digest':
-            # Keep the actual Digest username for HA1/MAA, but use the
-            # canonical provisioned IMPI for ownership and registration state.
+            if private!=canonical:
+                if profile['definition'].get('service_type')!='fixed_voice':
+                    raise CxError(5002,reason='digest_bootstrap_requires_fixed_voice')
+                if canonical not in profile['public']['private_identities']:
+                    raise CxError(5002,reason='digest_bootstrap_identity_not_associated')
+                digest_username=canonical
             profile=dict(profile,private=canonical)
         self.authorize(profile)
         maximum=int(self.settings.get('max_auth_items',5))
         if maximum<1:raise ValueError('max_auth_items must be positive')
         count=min(count,maximum)
         if scheme=='SIP Digest':count=1  # TS 29.228 Table 6.3.4
-        payload=self.avp(1,private)+self.avp(601,public,VENDOR);vectors=''
+        payload=self.avp(1,digest_username if scheme=='SIP Digest' else private)+self.avp(601,public,VENDOR);vectors=''
         with self.repo.transaction([profile['record']['ims_subscriber_id']]) as c:
             state=self.repo.state(profile,c);sub,auc=self.repo.credential(profile,c)
             if scheme=='SIP Digest':
                 if token_avp:raise CxError(5004,False,(610,VENDOR,token_avp['misc_data']))
                 realm=profile['definition']['digest_realm'];secret=auc['ki']
-                ha1=hashlib.md5(f'{private}:{realm}:{secret}'.encode()).hexdigest()
+                ha1=hashlib.md5(f'{digest_username}:{realm}:{secret}'.encode()).hexdigest()
                 digest=self.grouped(635,self.avp(104,realm)+self.avp(111,'MD5')+self.avp(110,'auth')+self.avp(121,ha1))
                 vectors=self.grouped(612,self.avp(608,'SIP Digest',VENDOR)+digest)
             else:
