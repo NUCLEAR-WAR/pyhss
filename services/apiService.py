@@ -2799,6 +2799,31 @@ class ForceClearCxRegistration(Resource):
             current_app.logger.exception('[CxForceClear] subscriber=%s failed',ims_subscriber_id)
             return {'status':'error','message':'Force clear failed; no successful cleanup reported'},500
 
+@ns_provisioning.route('/subscriber/<int:subscriber_id>/emergency-delete/')
+class EmergencyDeleteSubscriber(Resource):
+    @auth_required
+    def post(self, subscriber_id):
+        """Explicit, audited native emergency deletion; no RTR or Cx JSON parsing."""
+        try:
+            body=request.get_json(silent=True) or {}
+            if body.get('confirm') != 'EMERGENCY_DELETE_SUBSCRIBER':
+                return {'status':'confirmation_required'},400
+            operator=str(body.get('operator') or '').strip()
+            reason=str(body.get('reason') or '').strip()
+            if not operator or len(reason)<12:
+                return {'status':'invalid_request','message':'Operator and reason (12+ characters) required'},400
+            audit_id=str(uuid.uuid4())
+            result=cxProvisioning.repo.emergency_delete_subscriber(
+                subscriber_id,operator,reason,audit_id)
+            current_app.logger.warning('[CxEmergencyDelete] audit_id=%s subscriber_id=%s operator=%s',
+                                       audit_id,subscriber_id,operator)
+            return _cx_json_safe(result),200
+        except CxError:
+            return {'status':'not_found'},404
+        except Exception:
+            current_app.logger.exception('[CxEmergencyDelete] subscriber_id=%s failed',subscriber_id)
+            return {'status':'error','message':'Native emergency deletion failed and was rolled back'},500
+
 @ns_provisioning.route('/subscriber/')
 class ProvisionSubscriberService(Resource):
     def put(self):

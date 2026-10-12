@@ -480,6 +480,56 @@ class CxRepository:
                 'scscf_notified':False,'subscriber_deleted':False,
                 'warning':'HSS state cleared only. S-CSCF SIP contacts may remain active.'}
 
+    def emergency_delete_subscriber(self, subscriber_id, operator, reason, audit_id):
+        """Last-resort native deletion without loading/validating corrupt Cx JSON.
+
+        Only known subscriber-owned rows are removed. Database FK errors roll
+        back the entire native deletion; unknown dependent tables are NOT
+        bypassed with FOREIGN_KEY_CHECKS=0.
+        """
+        if not operator or not operator.strip():raise ValueError('Operator identity is required')
+        if not reason or len(reason.strip()) < 12:raise ValueError('Reason must contain at least 12 characters')
+        with self.transaction() as c:
+            subscriber=c.execute(select(self.sub).where(
+                self.sub.c.subscriber_id==subscriber_id).with_for_update()).mappings().first()
+            if not subscriber:raise CxError(5001,reason='subscriber_not_found')
+            subscriber=dict(subscriber)
+            imsi=subscriber['imsi']
+            ims_rows=[dict(r) for r in c.execute(select(self.ims).where(
+                self.ims.c.imsi==imsi).with_for_update()).mappings()]
+            ids=[r['ims_subscriber_id'] for r in ims_rows]
+            prior=[]
+            for ident in ids:
+                state=c.execute(select(self.states).where(
+                    self.states.c.ims_subscriber_id==ident)).mappings().first()
+                profile=c.execute(select(self.profiles).where(
+                    self.profiles.c.ims_subscriber_id==ident)).mappings().first()
+                prior.append({'ims_subscriber_id':ident,'legacy':next(x for x in ims_rows if x['ims_subscriber_id']==ident),
+                              'cx_state':dict(state) if state else None,
+                              'profile_present':profile is not None})
+            # Audit survives deletion and is written in the SAME transaction.
+            c.execute(self.force_audit.insert().values(
+                audit_id=audit_id,ims_subscriber_id=ids[0] if ids else 0,
+                operator=operator.strip(),reason='EMERGENCY_DELETE: '+reason.strip(),
+                previous_state=json.dumps({'subscriber_id':subscriber_id,'imsi':imsi,
+                    'ims_subscriptions':prior,'scscf_notified':False},default=str),
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None)))
+            for ident in ids:
+                c.execute(delete(self.identities).where(self.identities.c.ims_subscriber_id==ident))
+                c.execute(delete(self.profiles).where(self.profiles.c.ims_subscriber_id==ident))
+                c.execute(delete(self.states).where(self.states.c.ims_subscriber_id==ident))
+                c.execute(delete(self.ims).where(self.ims.c.ims_subscriber_id==ident))
+            c.execute(delete(self.sub).where(self.sub.c.subscriber_id==subscriber_id))
+            # Delete credentials only if no other subscriber owns them.
+            auc_id=subscriber.get('auc_id')
+            if auc_id is not None and not c.execute(select(self.sub.c.subscriber_id).where(
+                    self.sub.c.auc_id==auc_id)).first():
+                c.execute(delete(self.auc).where(self.auc.c.auc_id==auc_id))
+        return {'status':'native_deleted','subscriber_id':subscriber_id,
+                'ims_subscriber_ids':ids,'audit_id':audit_id,
+                'scscf_notified':False,'network_registration_may_remain':True,
+                'warning':'Native PyHSS subscriber deleted. External UDR/PCF state is not part of this transaction.'}
+
     def credential(self,profile,c):
         subscriber=c.execute(select(self.sub).where(self.sub.c.imsi==profile['record']['imsi'])).mappings().first()
         if not subscriber:raise CxError(5001,reason='native_subscriber_not_found')
