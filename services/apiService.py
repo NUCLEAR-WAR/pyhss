@@ -2605,7 +2605,7 @@ class ProvisionCxPushProfile(Resource):
 class ProvisionCxDeregister(Resource):
     @auth_required
     def post(self, ims_subscriber_id):
-        """Send an RTR and report RTA. Never delete or locally clear registration."""
+        """Send scoped RTR and reconcile HSS registration after successful RTA."""
         request_id = uuid.uuid4().hex
         current_app.logger.warning('[CxRTR] request_id=%s subscriber=%s request_started',
                                    request_id, ims_subscriber_id)
@@ -2712,8 +2712,7 @@ class ProvisionCxDeregister(Resource):
             destination_host = urlsplit(scscf.replace('sip:', 'sip://', 1)).hostname
             if not destination_host:
                 return {'status': 'invalid_scscf', 'ims_subscriber_id': ims_subscriber_id}, 409
-            # Recheck the registration state immediately before queuing; the
-            # response does not itself authorize deletion or local state clearing.
+            # Snapshot before queuing; reconciliation will verify it under lock.
             from cx_outbound_transactions import await_correlated_answer
             current_app.logger.warning(
                 '[CxRTR] request_id=%s subscriber=%s scscf=%s destination_host=%s peer_hint=%s realm=%s',
@@ -2763,10 +2762,14 @@ class ProvisionCxDeregister(Resource):
             else:
                 safe['hss_state_reconciled'] = False
                 safe['reconciliation_status'] = 'rta_not_confirmed'
-            safe['note'] = ('RTA result and HSS reconciliation are reported separately. '
-                            'SIP Contact removal is not independently verified. '
-                            'No subscriber deletion or policy barring performed.')
-            return _cx_json_safe(safe), (200 if result.get('status') == 'success' else 502)
+            safe['note'] = ('A successful RTA triggers scoped HSS registration cleanup. '
+                            'SIP contact removal is acknowledged by S-CSCF but not independently verified. '
+                            'Subscriber provisioning and barring policies are unchanged.')
+            if safe['rta_confirmed'] and not safe.get('hss_state_reconciled'):
+                # Never report an end-to-end successful deregistration when
+                # local cleanup failed or a concurrent state change was detected.
+                return _cx_json_safe(safe), 409
+            return _cx_json_safe(safe), (200 if safe['rta_confirmed'] else 502)
         except Exception as error:
             current_app.logger.exception('[CxRTR] request_id=%s unexpected_failure', request_id)
             return handle_exception(error)

@@ -433,7 +433,13 @@ class CxRepository:
         registered=any(g['registered'] for g in groups.values())
         if not registered:state['registered_at']=None
         elif not state.get('registered_at'):state['registered_at']=now
-        if c.execute(select(self.states.c.ims_subscriber_id).where(self.states.c.ims_subscriber_id==ident)).first():
+        # Fully released state has no reason to retain a runtime row.
+        empty = (not any(g.get('registered') or g.get('pending') or
+                         g.get('state') == 'unregistered' or g.get('scscf')
+                         for g in groups.values()) and not state.get('scscf'))
+        if empty:
+            c.execute(delete(self.states).where(self.states.c.ims_subscriber_id==ident))
+        elif c.execute(select(self.states.c.ims_subscriber_id).where(self.states.c.ims_subscriber_id==ident)).first():
             c.execute(update(self.states).where(self.states.c.ims_subscriber_id==ident).values(**state))
         else:c.execute(self.states.insert().values(**state))
         # Keep existing Admin/statistics/API consumers synchronized. Pending
