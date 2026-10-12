@@ -166,7 +166,7 @@ class CxProvisioning:
             override_private=generated_private and ('bar_private_impu' in policy or bool(meta))
             if item['identity'] in bars and item['identity'] not in explicit_ids and not override_private:
                 item['barred']=bars[item['identity']]
-        result['provisioning']['bar_private_impu']=next(item.get('barred',False) for item in result['public_identities'] if item['identity']==private_public)
+        result['provisioning']['bar_private_impu']=next((item.get('barred',False) for item in result['public_identities'] if item['identity']==private_public),False)
         self.repo.xml(record)
         return self.repo.prepare_definition(record,result)
 
