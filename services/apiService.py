@@ -2774,6 +2774,31 @@ class ProvisionCxDeregister(Resource):
             current_app.logger.exception('[CxRTR] request_id=%s unexpected_failure', request_id)
             return handle_exception(error)
 
+@ns_provisioning.route('/cx/<int:ims_subscriber_id>/force-clear/')
+class ForceClearCxRegistration(Resource):
+    @auth_required
+    def post(self, ims_subscriber_id):
+        """Administrative recovery, independent of RTR/RTA."""
+        try:
+            body=request.get_json(silent=True) or {}
+            if body.get('confirm') != 'FORCE_CLEAR_REGISTRATION':
+                return {'status':'confirmation_required'},400
+            operator=str(body.get('operator') or '').strip()
+            reason=str(body.get('reason') or '').strip()
+            if not operator or len(reason)<12:
+                return {'status':'invalid_request','message':'Operator and reason (12+ characters) required'},400
+            audit_id=str(uuid.uuid4())
+            result=cxProvisioning.repo.force_clear_registration(
+                ims_subscriber_id,operator,reason,audit_id)
+            current_app.logger.warning('[CxForceClear] audit_id=%s subscriber=%s operator=%s reason=%s',
+                audit_id,ims_subscriber_id,operator,reason)
+            return _cx_json_safe(result),200
+        except CxError as error:
+            return {'status':'not_found','reason':str(error)},404
+        except Exception:
+            current_app.logger.exception('[CxForceClear] subscriber=%s failed',ims_subscriber_id)
+            return {'status':'error','message':'Force clear failed; no successful cleanup reported'},500
+
 @ns_provisioning.route('/subscriber/')
 class ProvisionSubscriberService(Resource):
     def put(self):

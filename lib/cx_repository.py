@@ -103,6 +103,15 @@ class CxRepository:
             Column('scscf',String(512)),Column('realm',String(255)),Column('peer',String(512)),
             Column('groups_json',Text,nullable=False),Column('registered_at',DateTime),
             Column('updated_at',DateTime,nullable=False))
+        # Independent audit ledger: deliberately no FK to the IMS subscriber,
+        # so evidence survives a later subscriber deletion.
+        self.force_audit=Table('ims_cx_force_audit',self.metadata,
+            Column('audit_id',String(36),primary_key=True),
+            Column('ims_subscriber_id',Integer,nullable=False),
+            Column('operator',String(255),nullable=False),
+            Column('reason',Text,nullable=False),
+            Column('previous_state',Text,nullable=False),
+            Column('created_at',DateTime,nullable=False))
         if not initialize_schema:return
         # Startup-only additive DDL, never a migration of provisioned identities.
         for attempt in range(4):
@@ -446,6 +455,30 @@ class CxRepository:
         # authentication stores routing but never stamps a successful registration.
         c.execute(update(self.ims).where(self.ims.c.ims_subscriber_id==ident).values(
             scscf=state['scscf'],scscf_realm=state['realm'],scscf_peer=state['peer'],scscf_timestamp=state['registered_at']))
+
+    def force_clear_registration(self, ident, operator, reason, audit_id):
+        """Explicit administrative HSS-only cleanup; never contacts S-CSCF."""
+        if not operator or not operator.strip():raise ValueError('Operator identity is required')
+        if not reason or len(reason.strip()) < 12:raise ValueError('Reason must contain at least 12 characters')
+        with self.transaction([ident]) as c:
+            record=self.record(ident,c)
+            row=c.execute(select(self.states).where(self.states.c.ims_subscriber_id==ident).with_for_update()).mappings().first()
+            previous={'ims':{'scscf':record.get('scscf'), 'scscf_peer':record.get('scscf_peer'),
+                             'scscf_realm':record.get('scscf_realm'),
+                             'scscf_timestamp':str(record.get('scscf_timestamp') or '')},
+                      'cx_state':dict(row) if row else None}
+            # Persist the complete previous state and audit before clearing it,
+            # in the same database transaction.
+            c.execute(self.force_audit.insert().values(audit_id=audit_id,
+                ims_subscriber_id=ident,operator=operator.strip(),reason=reason.strip(),
+                previous_state=json.dumps(previous,default=str),
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None)))
+            c.execute(delete(self.states).where(self.states.c.ims_subscriber_id==ident))
+            c.execute(update(self.ims).where(self.ims.c.ims_subscriber_id==ident).values(
+                scscf=None,scscf_realm=None,scscf_peer=None,scscf_timestamp=None))
+        return {'status':'locally_cleared','audit_id':audit_id,'ims_subscriber_id':ident,
+                'scscf_notified':False,'subscriber_deleted':False,
+                'warning':'HSS state cleared only. S-CSCF SIP contacts may remain active.'}
 
     def credential(self,profile,c):
         subscriber=c.execute(select(self.sub).where(self.sub.c.imsi==profile['record']['imsi'])).mappings().first()
