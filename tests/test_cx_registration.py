@@ -386,6 +386,23 @@ def test_rtr_names_private_identity_actually_known_to_scscf(lab):
     _,avps=d.decode_diameter_packet(bytes.fromhex(packet))
     assert bytes.fromhex(d.get_avp_data(avps,1)[0]).decode()==other
 
+def test_scoped_rtr_encodes_selected_identity_and_reason(lab):
+    d,_=lab;mar(d);sar(d,1)
+    packet=d.Request_16777216_304(
+        FIXED_IMSI,REALM,'scscf.'+REALM,REALM,registration_sets=['voice'],
+        private_identity=IMPI,reason_code=2,reason_info='node shutdown')
+    _,avps=d.decode_diameter_packet(bytes.fromhex(packet))
+    assert [bytes.fromhex(x).decode() for x in d.get_avp_data(avps,1)]==[IMPI]
+    assert set(bytes.fromhex(x).decode() for x in d.get_avp_data(avps,601))=={
+        IMPU,'tel:+'+FIXED_MSISDN}
+    assert not d.get_avp_data(avps,632)
+    assert d.cx.grouped(615,d.cx.avp(616,2,10415,True)+
+                        d.cx.avp(617,'node shutdown',10415)) in packet
+    with pytest.raises(ValueError,match='selected registration set'):
+        d.Request_16777216_304(
+            FIXED_IMSI,REALM,'scscf.'+REALM,REALM,
+            registration_sets=['wrong-set'],private_identity=IMPI)
+
 def test_saa_xml_validates_with_supplied_ims_schema(lab):
     etree=pytest.importorskip('lxml.etree')
     schema=etree.XMLSchema(etree.parse(str(Path(__file__).parent/'fixtures/CxDataType_Rel8.xsd')))

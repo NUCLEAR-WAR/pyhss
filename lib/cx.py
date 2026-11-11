@@ -328,7 +328,8 @@ class CxService:
             return 2003,self.capabilities(),True
         raise CxError(5003,reason='terminating_unregistered_service_not_available')
 
-    def rtr(self,imsi,destination_host,destination_realm):
+    def rtr(self,imsi,destination_host,destination_realm,*,registration_sets=None,
+            private_identity=None,reason_code=0,reason_info=None):
         """Terminate a provisioned IMS subscription using its actual private IDs."""
         with self.repo.engine.connect() as c:
             records=c.execute(select(self.repo.ims).where(self.repo.ims.c.imsi==imsi)).mappings().all()
@@ -342,11 +343,40 @@ class CxService:
                     if identity not in known:known.append(identity)
             target=known[0] if known else definition['private_identities'][0]
             target=definition.get('digest_identity_aliases',{}).get(target,target)
+        scoped=registration_sets is not None or private_identity is not None
+        publics=[]
+        if type(reason_code) is not int or reason_code not in (0,1,2,3):
+            raise ValueError('Invalid RTR reason code')
+        if reason_info is not None and (not isinstance(reason_info,str) or len(reason_info.encode())>512):
+            raise ValueError('Invalid RTR reason info')
+        if scoped:
+            if (not isinstance(registration_sets,(list,tuple)) or len(registration_sets)!=1
+                    or not isinstance(registration_sets[0],str) or not private_identity):
+                raise ValueError('Scoped RTR requires one registration set and a private identity')
+            set_id=registration_sets[0]
+            aliases=definition.get('digest_identity_aliases',{})
+            target=aliases.get(private_identity,private_identity)
+            group=state['groups'].get(set_id,{})
+            publics=[item['identity'] for item in definition['public_identities']
+                     if item['set_id']==set_id and target in
+                     {aliases.get(i,i) for i in item['private_identities']}]
+            if target not in definition['private_identities'] or not publics:
+                raise ValueError('RTR private identity does not belong to the selected registration set')
+            registered=group.get('registered') or []
+            if reason_code==3:
+                if group.get('state')!='unregistered' or registered or not group.get('scscf'):
+                    raise ValueError('RTR reason 3 requires a retained unregistered assignment')
+            elif target not in {aliases.get(i,i) for i in registered}:
+                raise ValueError('RTR private identity is no longer registered in the selected set')
         sid=bytes.fromhex(self.d.OriginHost).decode()+';cx-rtr;'+__import__('uuid').uuid4().hex
         payload=self.avp(263,sid)+self.d.generate_avp(264,'40',self.d.OriginHost)+self.d.generate_avp(296,'40',self.d.OriginRealm)
         payload+=self.grouped(260,self.avp(266,VENDOR,integer=True)+self.avp(258,CX_APP,integer=True),vendor=0)
         payload+=self.avp(277,1,integer=True)+self.avp(293,destination_host)+self.avp(283,destination_realm)+self.avp(1,target)
-        payload+=self.grouped(615,self.avp(616,0,VENDOR,True)+self.avp(617,'Administrative de-registration',VENDOR))
-        associated=[x for x in definition['private_identities'] if x!=target and x not in definition.get('digest_identity_aliases',{})]
+        payload+=''.join(self.avp(601,public,VENDOR) for public in publics)
+        reason=self.avp(616,reason_code,VENDOR,True)
+        if reason_info is not None or not scoped:
+            reason+=self.avp(617,reason_info if reason_info is not None else 'Administrative de-registration',VENDOR)
+        payload+=self.grouped(615,reason)
+        associated=[] if scoped else [x for x in definition['private_identities'] if x!=target and x not in definition.get('digest_identity_aliases',{})]
         if associated:payload+=self.grouped(632,''.join(self.avp(1,x) for x in associated))
         return self.d.generate_diameter_packet('01','c0',304,CX_APP,self.d.generate_id(4),self.d.generate_id(4),payload)
