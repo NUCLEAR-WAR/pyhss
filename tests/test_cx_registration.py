@@ -403,6 +403,46 @@ def test_scoped_rtr_encodes_selected_identity_and_reason(lab):
             FIXED_IMSI,REALM,'scscf.'+REALM,REALM,
             registration_sets=['wrong-set'],private_identity=IMPI)
 
+def test_live_ifc_push_encodes_audited_version(lab):
+    import xml.etree.ElementTree as ET
+    d,profiles=lab
+    repo=d.cx.repo
+    ident=profiles[0][0]['ims_subscriber_id']
+    mar(d);sar(d,1)
+    route=snapshot(d)['groups']['voice']
+    fragment=('<InitialFilterCriteria><Priority>7</Priority><ApplicationServer>'
+              '<ServerName>sip:tas.example.invalid</ServerName></ApplicationServer>'
+              '</InitialFilterCriteria>')
+    assert repo.live_ifc_get(ident,'voice')['version']==0
+    with pytest.raises(ValueError,match='Invalid iFC XML'):
+        repo.live_ifc_save(ident,'voice','<broken>',0)
+    assert repo.live_ifc_save(ident,'voice',fragment,0)['version']==1
+    with pytest.raises(ValueError,match='Version conflict'):
+        repo.live_ifc_save(ident,'voice',fragment,0)
+    with pytest.raises(ValueError,match='route changed'):
+        repo.ppr_begin(ident,'voice',IMPI,SERVER,1,realm='other.invalid',peer=route['peer'])
+    audit=repo.ppr_begin(ident,'voice',IMPI,SERVER,1,realm=REALM,peer=route['peer'])
+    def encode():
+        return d.Request_16777216_305(ident,'scscf.'+REALM,REALM,'voice',IMPI,
+                                      expected_profile_sha256=audit['sha256'])
+    packet=encode()
+    header,avps=d.decode_diameter_packet(bytes.fromhex(packet))
+    assert header['command_code']==305 and header['ApplicationId']==16777216
+    xml=bytes.fromhex(d.get_avp_data(avps,606)[0])
+    assert hashlib.sha256(xml).hexdigest()==audit['sha256']
+    root=ET.fromstring(xml)
+    assert root.findtext('PrivateID')==IMPI
+    assert root.findtext('.//InitialFilterCriteria/ApplicationServer/ServerName')=='sip:tas.example.invalid'
+    assert {x.text for x in root.findall('.//PublicIdentity/Identity')}=={IMPU,'tel:+'+FIXED_MSISDN}
+    assert repo.live_ifc_save(ident,'voice','',1)['version']==2
+    with pytest.raises(ValueError,match='profile changed'):
+        encode()
+    result=repo.ppr_finish(audit['operation_id'],'success',{'status':'success','request':packet})
+    assert result=={'saved_version':2,'acknowledged_version':1,'stale_after_push':True}
+    row=repo.ppr_history(ident,'voice')[0]
+    assert row['status']=='success' and row['profile_sha256']==audit['sha256']
+    assert 'request' not in json.loads(row['response_json'])
+
 def test_saa_xml_validates_with_supplied_ims_schema(lab):
     etree=pytest.importorskip('lxml.etree')
     schema=etree.XMLSchema(etree.parse(str(Path(__file__).parent/'fixtures/CxDataType_Rel8.xsd')))

@@ -4465,9 +4465,10 @@ class Diameter:
 
     # 3GPP Cx Push Profile Request (PPR)
     def Request_16777216_305(self, ims_subscriber_id, destinationHost, destinationRealm,
-                              registration_set, private_identity):
+                              registration_set, private_identity, *, expected_profile_sha256=None):
         return self.cx.ppr(ims_subscriber_id, destinationHost, destinationRealm,
-                           registration_set, private_identity)
+                           registration_set, private_identity,
+                           expected_profile_sha256=expected_profile_sha256)
 
     #3GPP Cx Registration Termination Request (RTR)
     def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm, registration_sets=None, private_identity=None, reason_code=0, reason_info=None):

@@ -2573,17 +2573,23 @@ class ProvisionCxPushProfile(Resource):
             if expected_version is not None and type(expected_version) is not int:
                 return {'status':'invalid_version'},400
             try:
-                audit=repo.ppr_begin(ims_subscriber_id,selected_set,selected_impi,scscf,expected_version)
+                audit=repo.ppr_begin(ims_subscriber_id,selected_set,selected_impi,scscf,expected_version,
+                                     realm=realm,peer=peer)
             except ValueError as error:
                 return {'status':'conflict','reason':str(error)},409
             operation_id=audit['operation_id']
             current_app.logger.warning('[CxPPR] id=%s subscriber=%s set=%s version=%s destination=%s started',
                                        operation_id, ims_subscriber_id, selected_set,audit['version'],hostname)
             from cx_outbound_transactions import await_correlated_answer
-            result = await_correlated_answer(
-                diameterClient, 'PPR', hostname=hostname, peer_hint=peer, timeout=timeout,
-                ims_subscriber_id=ims_subscriber_id, registration_set=selected_set,
-                private_identity=selected_impi, destinationHost=hostname, destinationRealm=realm)
+            try:
+                result = await_correlated_answer(
+                    diameterClient, 'PPR', hostname=hostname, peer_hint=peer, timeout=timeout,
+                    ims_subscriber_id=ims_subscriber_id, registration_set=selected_set,
+                    private_identity=selected_impi, destinationHost=hostname, destinationRealm=realm,
+                    expected_profile_sha256=audit['sha256'])
+            except Exception:
+                current_app.logger.exception('[CxPPR] id=%s outbound failure', operation_id)
+                result = {'status': 'internal_error', 'operation': 'PPR'}
             current_app.logger.warning('[CxPPR] id=%s status=%s', operation_id, result.get('status'))
             tracking=repo.ppr_finish(operation_id,result.get('status') or 'unknown',result)
             return _cx_json_safe({
