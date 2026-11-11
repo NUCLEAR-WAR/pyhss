@@ -146,6 +146,9 @@ def test_number_impi_maps_to_existing_credentials_and_first_uar_is_read_only(lab
     avps,_=request(d,300);assert result(d,avps)==('experimental',2002)
     avps,_=sar(d,1);assert result(d,avps)==('base',2001)
     assert snapshot(d)['groups']['voice']['pending']==[] and snapshot(d)['registered_at']
+    state=snapshot(d)
+    assert {key:state['groups']['voice'][key] for key in ('scscf','realm','peer')} == {
+        'scscf':SERVER,'realm':REALM,'peer':state['peer']}
     avps,_=request(d,302,private=None,public='tel:+'+FIXED_MSISDN)
     assert result(d,avps)==('base',2001)
 
@@ -200,7 +203,10 @@ def test_deregistration_clears_server_without_user_data(lab,typ):
 def test_store_server_deregistration_retains_unregistered_state(lab,typ):
     d,_=lab;mar(d);sar(d,1)
     avps,_=sar(d,typ);assert result(d,avps)==('base',2001)
-    assert snapshot(d)['groups']['voice']['state']=='unregistered'
+    state=snapshot(d)
+    assert state['groups']['voice']['state']=='unregistered'
+    assert {key:state['groups']['voice'][key] for key in ('scscf','realm','peer')} == {
+        key:state[key] for key in ('scscf','realm','peer')}
     avps,_=request(d,300);assert result(d,avps)==('experimental',2002)
 
 @pytest.mark.parametrize('typ',[9,10])

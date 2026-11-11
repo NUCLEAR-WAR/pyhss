@@ -275,11 +275,9 @@ class CxService:
                     group['pending']=[p for p in group['pending'] if p!=private]
                     known=group.setdefault('known_private',[])
                     if private not in known:known.append(private)
-                    state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
                 elif typ==3:
                     chosen=private or self.repo.default_authentication_identity(profile)
                     group={'state':'unregistered','registered':[],'pending':[],'known_private':[chosen]}
-                    state.update(scscf=server,realm=self.text(avps,296),peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
                 elif typ in (9,10):
                     group['pending']=[p for p in group['pending'] if p!=profile['private']]
                 else:
@@ -300,6 +298,15 @@ class CxService:
                             group['pending']=[]
                             group['known_private']=[]
                     if typ in (6,7) and not keep:code=2004;experimental=True
+                if typ in (1,2,3):
+                    route=dict(scscf=server,realm=self.text(avps,296),
+                               peer=self.text(avps,264)+';'+bytes.fromhex(self.d.OriginHost).decode())
+                    # Scoped RTR and PPR must use the route learned for this IRS.
+                    group.update(route)
+                    state.update(route)
+                elif group['state']=='not_registered':
+                    for key in ('scscf','realm','peer'):
+                        group.pop(key,None)
                 state['groups'][set_id]=group
                 if not any(g['state'] in ('registered','unregistered') or g['pending'] for g in state['groups'].values()):
                     state.update(scscf=None,realm=None,peer=None)
